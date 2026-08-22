@@ -180,7 +180,7 @@ namespace mem_guard {
     }
 }
 
-NTSTATUS functions::handle777e(p_physical_rw request) {
+NTSTATUS functions::handle777e(p_physical_rw request, KPROCESSOR_MODE requestor_mode) {
     LARGE_INTEGER freq{};
     LARGE_INTEGER start = KeQueryPerformanceCounter(&freq);
     if (!request) {
@@ -209,7 +209,9 @@ NTSTATUS functions::handle777e(p_physical_rw request) {
         start.QuadPart,
         __rdtsc());
 
-    if (!request->buffer || request->size == 0) {
+    if (!request->buffer || request->size == 0 ||
+        request->size - 1 > MAXUINT64 - (UINT64)request->address ||
+        request->size - 1 > MAXUINT64 - (UINT64)request->buffer) {
         WW_LOG("PHYS_RW_EXIT pid=%lu dtb=0x%llx va=0x%llx size=0x%llx should_write=%u status=0x%08X ret=0 reason=bad_buffer_or_size elapsed_us=%llu",
             (ULONG)request->pid,
             request->dtb,
@@ -293,6 +295,32 @@ NTSTATUS functions::handle777e(p_physical_rw request) {
         mem_guard::log_page_walk(is_write ? "write" : "read", target_pid, process_dir_base, current_virtual_address, walk, physical_address);
         BOOLEAN chunk_done = FALSE;
 
+        if (!km_staging) {
+            km_staging = ExAllocatePool2(POOL_FLAG_NON_PAGED, 0x1000, 'sFwW');
+            if (!km_staging) {
+                final_status = STATUS_INSUFFICIENT_RESOURCES;
+                break;
+            }
+        }
+
+        PVOID current_buffer = (PVOID)((ULONG_PTR)request->buffer + current_offset);
+        __try {
+            if (requestor_mode != KernelMode) {
+                if (is_write) {
+                    ProbeForRead(current_buffer, transfer_size, 1);
+                    strong::kmemcpy(km_staging, current_buffer, transfer_size);
+                } else {
+                    ProbeForWrite(current_buffer, transfer_size, 1);
+                }
+            } else if (is_write) {
+                strong::kmemcpy(km_staging, current_buffer, transfer_size);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            final_status = (NTSTATUS)GetExceptionCode();
+            break;
+        }
+
         if (physical_address) {
             SIZE_T bytes_transferred = 0;
             NTSTATUS operation_status = STATUS_UNSUCCESSFUL;
@@ -300,7 +328,7 @@ NTSTATUS functions::handle777e(p_physical_rw request) {
             if (is_write) {
                 operation_status = strong::write_physical(
                     (PVOID)physical_address,
-                    (PVOID)((ULONG_PTR)request->buffer + current_offset),
+                    km_staging,
                     transfer_size,
                     &bytes_transferred
                 );
@@ -312,7 +340,7 @@ NTSTATUS functions::handle777e(p_physical_rw request) {
                 if (NT_SUCCESS(operation_status) && bytes_transferred > 0) {
                     readback_match = mem_guard::physical_readback_matches(
                         physical_address,
-                        (PVOID)((ULONG_PTR)request->buffer + current_offset),
+                        km_staging,
                         bytes_transferred,
                         &checked,
                         &readback_status,
@@ -341,7 +369,7 @@ NTSTATUS functions::handle777e(p_physical_rw request) {
             else {
                 operation_status = strong::read_physical(
                     physical_address,
-                    (PVOID)((ULONG_PTR)request->buffer + current_offset),
+                    km_staging,
                     transfer_size,
                     &bytes_transferred
                 );
@@ -360,6 +388,15 @@ NTSTATUS functions::handle777e(p_physical_rw request) {
                 (UINT64)remaining_size,
                 mem_guard::elapsed_us(start, freq));
             if (NT_SUCCESS(operation_status) && bytes_transferred > 0) {
+                if (!is_write) {
+                    __try {
+                        strong::kmemcpy(current_buffer, km_staging, bytes_transferred);
+                    }
+                    __except (EXCEPTION_EXECUTE_HANDLER) {
+                        final_status = (NTSTATUS)GetExceptionCode();
+                        break;
+                    }
+                }
                 total_bytes_transferred += bytes_transferred;
                 remaining_size -= bytes_transferred;
                 current_offset += bytes_transferred;
@@ -478,7 +515,14 @@ NTSTATUS functions::handle777e(p_physical_rw request) {
         }
 
         __try {
-            strong::kmemset((PVOID)((ULONG_PTR)request->buffer + current_offset), 0, transfer_size);
+            strong::kmemset(km_staging, 0, transfer_size);
+            __try {
+                strong::kmemcpy(current_buffer, km_staging, transfer_size);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                final_status = (NTSTATUS)GetExceptionCode();
+                break;
+            }
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             break;
         }

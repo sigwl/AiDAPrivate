@@ -17,6 +17,23 @@
 using json = nlohmann::json;
 
 static std::atomic<instance_registry_t*> g_active_registry{nullptr};
+thread_local const std::atomic<bool>* g_mcp_cancel_flag = nullptr;
+
+struct scoped_mcp_cancel_flag_t
+{
+    const std::atomic<bool>* previous = nullptr;
+
+    explicit scoped_mcp_cancel_flag_t(const std::atomic<bool>* flag)
+        : previous(g_mcp_cancel_flag)
+    {
+        g_mcp_cancel_flag = flag;
+    }
+
+    ~scoped_mcp_cancel_flag_t()
+    {
+        g_mcp_cancel_flag = previous;
+    }
+};
 
 static instance_registry_t* current_registry()
 {
@@ -25,6 +42,31 @@ static instance_registry_t* current_registry()
 
 static const char* kInstanceArgKey = "instance_id";
 static const char* kPidArgKey      = "pid";
+static const char* kPeerInstanceHeader = "X-AiDA-Peer-Instance";
+static const char* kPeerGenerationHeader = "X-AiDA-Peer-Generation";
+static const char* kPeerCapabilityHeader = "X-AiDA-Peer-Capability";
+
+static bool authenticate_peer_request(const httplib::Request& req)
+{
+    auto* registry = current_registry();
+    if (!registry)
+        return false;
+    ida_peer_authentication_t presented;
+    presented.instance_id = req.get_header_value(kPeerInstanceHeader);
+    presented.lifecycle_generation = req.get_header_value(kPeerGenerationHeader);
+    presented.capability = req.get_header_value(kPeerCapabilityHeader);
+    ida_peer_authentication_t local_auth;
+    if (!registry->self_peer_authentication(local_auth))
+        return false;
+    presented.pid = 0;
+    std::string pid_text = req.get_header_value("X-AiDA-Peer-Pid");
+    try { presented.pid = static_cast<uint64_t>(std::stoull(pid_text)); }
+    catch (...) { return false; }
+    std::string started_text = req.get_header_value("X-AiDA-Peer-Started-At");
+    try { presented.started_at_ms = static_cast<uint64_t>(std::stoull(started_text)); }
+    catch (...) { return false; }
+    return registry->authenticate_peer(presented);
+}
 
 static bool resolve_target_instance(const json& arguments,
                                     instance_registry_t* registry,
@@ -159,6 +201,28 @@ static mcp_remote_call_result_t mcp_invoke_remote(const ida_instance_record_t& p
             {"Content-Type", "application/json"},
             {"Accept",       "application/json"}
         };
+        auto* registry = current_registry();
+        ida_peer_authentication_t auth;
+        if (!registry || !registry->self_peer_authentication(auth)
+            || auth.instance_id.empty())
+        {
+            out.error_text = "local peer authentication unavailable";
+            return out;
+        }
+        ida_peer_authentication_t peer_auth;
+        if (!registry->load_peer_authentication(peer.instance_id, peer_auth)
+            || peer_auth.instance_id != peer.instance_id
+            || peer_auth.pid != peer.pid
+            || peer_auth.started_at_ms != peer.started_at_ms)
+        {
+            out.error_text = "peer authentication unavailable";
+            return out;
+        }
+        headers.emplace("X-AiDA-Peer-Instance", auth.instance_id);
+        headers.emplace("X-AiDA-Peer-Generation", auth.lifecycle_generation);
+        headers.emplace("X-AiDA-Peer-Capability", auth.capability);
+        headers.emplace("X-AiDA-Peer-Pid", std::to_string(auth.pid));
+        headers.emplace("X-AiDA-Peer-Started-At", std::to_string(auth.started_at_ms));
         auto res = client.Post("/mcp", headers, body, "application/json");
         if (!res)
         {
@@ -1330,6 +1394,7 @@ static const std::vector<mcp_prompt_def_t>& get_prompt_definitions()
 struct sse_session_t
 {
     std::string id;
+    std::string remote_address;
     std::mutex mtx;
     std::condition_variable cv;
     std::queue<std::string> events;
@@ -2459,7 +2524,7 @@ static json handle_tools_call(const json& id, const json& params)
     if (!is_mcp_callable_tool(tool))
         return make_jsonrpc_error(id, JSONRPC_INVALID_PARAMS, "Tool is not exposed through MCP");
 
-    auto tool_result = execute_tool_in_main_thread(tool_name, prepared_args);
+    auto tool_result = execute_tool_in_main_thread(tool_name, prepared_args, g_mcp_cancel_flag);
     json result = build_mcp_tool_result_payload(tool_result);
     return make_jsonrpc_result(id, result);
 }
@@ -2871,6 +2936,62 @@ static json dispatch_single_message(const json& msg)
     json params = msg.value("params", json::object());
     bool is_notification = !msg.contains("id");
 
+    if (is_notification && method != "notifications/cancelled")
+    {
+        if (method == "notifications/initialized" || method == "logging/setLevel")
+            return json();
+        if (method == "initialize")
+        {
+            (void)handle_initialize(nullptr, params);
+            return json();
+        }
+        if (method == "ping")
+        {
+            (void)handle_ping(nullptr);
+            return json();
+        }
+        if (method == "tools/list")
+        {
+            (void)handle_tools_list(nullptr);
+            return json();
+        }
+        if (method == "tools/call")
+        {
+            (void)handle_tools_call(nullptr, params);
+            return json();
+        }
+        if (method == "resources/list")
+        {
+            (void)handle_resources_list(nullptr);
+            return json();
+        }
+        if (method == "resources/read")
+        {
+            (void)handle_resources_read(nullptr, params);
+            return json();
+        }
+        if (method == "resources/templates/list")
+        {
+            (void)handle_resources_templates_list(nullptr);
+            return json();
+        }
+        if (method == "prompts/list")
+        {
+            (void)handle_prompts_list(nullptr);
+            return json();
+        }
+        if (method == "prompts/get")
+        {
+            (void)handle_prompts_get(nullptr, params);
+            return json();
+        }
+        if (method == "completion/complete")
+        {
+            (void)handle_completion_complete(nullptr, params);
+            return json();
+        }
+    }
+
     if (method == "initialize")
         return handle_initialize(id, params);
 
@@ -2913,8 +3034,24 @@ static json dispatch_single_message(const json& msg)
     return make_jsonrpc_error(id, JSONRPC_METHOD_NOT_FOUND, std::string("Unknown method: ") + method);
 }
 
-static std::string handle_mcp_body(const std::string& body)
+static std::string handle_mcp_body(const std::string& body, const std::function<bool()>& connection_closed)
 {
+    std::atomic<bool> cancel{false};
+    std::atomic<bool> monitor_done{false};
+    std::thread monitor([&]() {
+        while (!monitor_done.load(std::memory_order_acquire))
+        {
+            bool closed = false;
+            try { closed = connection_closed && connection_closed(); } catch (...) {}
+            if (closed)
+            {
+                cancel.store(true, std::memory_order_release);
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+    });
+    scoped_mcp_cancel_flag_t cancel_scope(&cancel);
 #ifdef __NT__
     aida_ipc::trace_breadcrumb("ida_mcp_handle_body_enter body_len=%zu", body.size());
 #endif
@@ -2925,6 +3062,8 @@ static std::string handle_mcp_body(const std::string& body)
     }
     catch (const json::parse_error& e)
     {
+        monitor_done.store(true, std::memory_order_release);
+        monitor.join();
         return json_dump_safe(make_jsonrpc_error(nullptr, JSONRPC_PARSE_ERROR,
             std::string("JSON parse error: ") + e.what()));
     }
@@ -2932,7 +3071,11 @@ static std::string handle_mcp_body(const std::string& body)
     if (parsed.is_array())
     {
         if (parsed.empty())
+        {
+            monitor_done.store(true, std::memory_order_release);
+            monitor.join();
             return json_dump_safe(make_jsonrpc_error(nullptr, JSONRPC_INVALID_REQUEST, "Empty batch"));
+        }
 
         json responses = json::array();
         for (const auto& item : parsed)
@@ -2943,13 +3086,25 @@ static std::string handle_mcp_body(const std::string& body)
         }
 
         if (responses.empty())
+        {
+        monitor_done.store(true, std::memory_order_release);
+        monitor.join();
             return "";
+        }
+        monitor_done.store(true, std::memory_order_release);
+        monitor.join();
         return json_dump_safe(responses);
     }
 
     json response = dispatch_single_message(parsed);
     if (response.is_null())
+    {
+        monitor_done.store(true, std::memory_order_release);
+        monitor.join();
         return "";
+    }
+    monitor_done.store(true, std::memory_order_release);
+    monitor.join();
     return json_dump_safe(response);
 }
 
@@ -3511,6 +3666,11 @@ void mcp_server_t::server_thread_func(int port)
     aida_ipc::trace_breadcrumb("ida_mcp_server_thread_func_enter port=%d", port);
 #endif
     httplib::Server svr;
+    svr.set_payload_max_length(64u * 1024u * 1024u);
+    svr.set_read_timeout(5, 0);
+    svr.set_write_timeout(10, 0);
+    svr.set_keep_alive_timeout(2);
+    svr.set_keep_alive_max_count(64);
 
     {
         std::lock_guard<std::mutex> lock(_server_mutex);
@@ -3520,18 +3680,46 @@ void mcp_server_t::server_thread_func(int port)
     std::string session_id = generate_session_id();
 
     svr.set_default_headers({
-        {"Access-Control-Allow-Origin",  "*"},
-        {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"},
-        {"Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id, Accept"},
-        {"Access-Control-Expose-Headers", "Mcp-Session-Id"}
+        {"Cache-Control", "no-store"},
+        {"X-Content-Type-Options", "nosniff"}
     });
 
-    svr.Options(".*", [](const httplib::Request&, httplib::Response& res) {
-        res.status = 204;
+    svr.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+        const bool loopback = req.remote_addr == "127.0.0.1" || req.remote_addr == "::1" || req.remote_addr == "localhost";
+        const std::string host = req.get_header_value("Host");
+        const std::string expected = "127.0.0.1:" + std::to_string(_port);
+        const std::string expected_localhost = "localhost:" + std::to_string(_port);
+        const bool host_valid = host == expected || host == expected_localhost;
+        const bool origin_valid = req.get_header_value("Origin").empty();
+        if (!loopback || !host_valid || !origin_valid) {
+            res.status = 403;
+            res.set_content(R"({"status":"rejected","error":"MCP local authorization failed","code":"MCP_LOCAL_AUTH_REQUIRED","disposition":"not_started"})", "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        if (req.method == "OPTIONS") {
+            res.status = 204;
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        const bool has_peer_auth_header =
+            req.has_header(kPeerInstanceHeader) || req.has_header(kPeerGenerationHeader)
+            || req.has_header(kPeerCapabilityHeader) || req.has_header("X-AiDA-Peer-Pid")
+            || req.has_header("X-AiDA-Peer-Started-At");
+        const bool has_all_peer_auth_headers =
+            req.has_header(kPeerInstanceHeader) && req.has_header(kPeerGenerationHeader)
+            && req.has_header(kPeerCapabilityHeader) && req.has_header("X-AiDA-Peer-Pid")
+            && req.has_header("X-AiDA-Peer-Started-At");
+        if (has_peer_auth_header != has_all_peer_auth_headers
+            || (has_all_peer_auth_headers && !authenticate_peer_request(req)))
+        {
+            res.status = 403;
+            res.set_content(R"({"status":"rejected","error":"MCP peer authentication failed","code":"MCP_PEER_AUTH_FAILED"})", "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
     });
 
     svr.Post("/mcp", [&session_id](const httplib::Request& req, httplib::Response& res) {
-        std::string response_body = handle_mcp_body(req.body);
+        std::string response_body = handle_mcp_body(req.body, [&req]() { return req.is_connection_closed ? req.is_connection_closed() : false; });
 
         res.set_header("Mcp-Session-Id", session_id);
 
@@ -3687,7 +3875,21 @@ void mcp_server_t::server_thread_func(int port)
             return;
         }
 
-        auto tool_result = execute_tool_in_main_thread(tool_name, arguments);
+        std::atomic<bool> cancel{false};
+        std::atomic<bool> monitor_done{false};
+        std::thread monitor([&]() {
+            while (!monitor_done.load(std::memory_order_acquire)) {
+                if (req.is_connection_closed && req.is_connection_closed()) {
+                    cancel.store(true, std::memory_order_release);
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+        });
+        scoped_mcp_cancel_flag_t cancel_scope(&cancel);
+        auto tool_result = execute_tool_in_main_thread(tool_name, arguments, &cancel);
+        monitor_done.store(true, std::memory_order_release);
+        monitor.join();
 
         json resp;
         resp["success"] = tool_result.success;
@@ -3761,9 +3963,10 @@ void mcp_server_t::server_thread_func(int port)
     std::map<std::string, std::shared_ptr<sse_session_t>> sse_sessions;
     std::mutex sse_mtx;
 
-    svr.Get("/sse", [this, &sse_sessions, &sse_mtx](const httplib::Request&, httplib::Response& res) {
+    svr.Get("/sse", [this, &sse_sessions, &sse_mtx](const httplib::Request& req, httplib::Response& res) {
         auto session = std::make_shared<sse_session_t>();
         session->id = generate_session_id();
+        session->remote_address = req.remote_addr;
 
         {
             std::lock_guard<std::mutex> lk(sse_mtx);
@@ -3855,8 +4058,16 @@ void mcp_server_t::server_thread_func(int port)
             }
             session = it->second;
         }
+        if (!session || session->remote_address != req.remote_addr)
+        {
+            res.status = 403;
+            res.set_content(json_dump_safe(make_jsonrpc_error(nullptr,
+                JSONRPC_INVALID_REQUEST, "SSE session is bound to another local client")),
+                "application/json");
+            return;
+        }
 
-        std::string response_body = handle_mcp_body(req.body);
+        std::string response_body = handle_mcp_body(req.body, [&req]() { return req.is_connection_closed ? req.is_connection_closed() : false; });
 
         if (!response_body.empty())
         {
@@ -3869,7 +4080,7 @@ void mcp_server_t::server_thread_func(int port)
     });
 
     svr.Post("/sse", [&session_id](const httplib::Request& req, httplib::Response& res) {
-        std::string response_body = handle_mcp_body(req.body);
+        std::string response_body = handle_mcp_body(req.body, [&req]() { return req.is_connection_closed ? req.is_connection_closed() : false; });
         res.set_header("Mcp-Session-Id", session_id);
         if (response_body.empty())
             res.status = 202;

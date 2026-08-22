@@ -548,11 +548,11 @@ static bool address_entry_by_index(size_t index, json& out) {
 	return true;
 }
 
-static bool read_memory_exact(uint64_t address, size_t size, std::vector<uint8_t>& out) {
+static bool read_memory_exact(uint32_t pid, uint64_t address, size_t size, std::vector<uint8_t>& out) {
 	out.clear();
 	if (size == 0)
 		return true;
-	if (!driver_bridge::read_memory(address, size, out) || out.size() < size)
+	if (!driver_bridge::read_memory_for(pid, address, size, out) || out.size() < size)
 		return false;
 	if (out.size() > size)
 		out.resize(size);
@@ -1163,7 +1163,8 @@ static tool_result_t handle_add_address(const json& params) {
 
 	std::vector<uint8_t> readback;
 	const size_t read_size = memory_scanner::value_type_size(vtype);
-	const bool readback_ok = read_memory_exact(addr, read_size, readback);
+	const uint32_t target_pid = driver_bridge::attached_pid();
+	const bool readback_ok = target_pid != 0 && read_memory_exact(target_pid, addr, read_size, readback);
 
 	json result;
 	add_scanner_action_context(result, "scanner_address_list_add");
@@ -2041,11 +2042,12 @@ static tool_result_t handle_watch_memory_layout(const json& params) {
 		return tool_result_t::error(std::string("Struct snapshot size exceeds 65536 bytes."));
 	if (address > std::numeric_limits<uint64_t>::max() - sd.total_size)
 		return tool_result_t::error(std::string("Struct snapshot address range overflows."));
-	if (!driver_bridge::can_read_memory())
+	const uint32_t target_pid = driver_bridge::attached_pid();
+	if (target_pid == 0)
 		return tool_result_t::error(std::string("Memory reader is unavailable or no process is attached."));
 
 	std::vector<uint8_t> block;
-	if (!driver_bridge::read_memory(address, sd.total_size, block) || block.size() < sd.total_size)
+	if (!driver_bridge::read_memory_for(target_pid, address, sd.total_size, block) || block.size() != sd.total_size)
 		return tool_result_t::error(std::string("Failed to read struct memory snapshot."));
 
 	json result = struct_snapshot_json(struct_index, sd, address, block);
@@ -2076,7 +2078,8 @@ static tool_result_t handle_assert_memory_type(const json& params) {
 	const uint64_t effective = add_signed_offset(address, offset, offset_ok);
 	if (!offset_ok)
 		return tool_result_t::error(std::string("Effective address overflow or offset outside allowed range."));
-	if (!driver_bridge::can_read_memory())
+	const uint32_t target_pid = driver_bridge::attached_pid();
+	if (target_pid == 0)
 		return tool_result_t::error(std::string("Memory reader is unavailable or no process is attached."));
 
 	const size_t read_size = assertion_read_size(expected_type, params);
@@ -2129,7 +2132,7 @@ static tool_result_t handle_assert_memory_type(const json& params) {
 		if (mcp_standalone::current_call_cancelled())
 			return tool_result_t::error(std::string("Memory type assertion cancelled during sampling."));
 		std::vector<uint8_t> bytes;
-		const bool read_ok = driver_bridge::read_memory(effective, read_size, bytes) && bytes.size() >= read_size;
+		const bool read_ok = driver_bridge::read_memory_for(target_pid, effective, read_size, bytes) && bytes.size() == read_size;
 		json sample;
 		sample["index"] = i;
 		sample["read_ok"] = read_ok;

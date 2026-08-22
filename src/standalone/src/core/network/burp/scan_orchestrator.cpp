@@ -40,6 +40,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -2458,6 +2459,35 @@ void shutdown()
             if (id != job->scan_id)
                 active_scanner::cancel_audit(id);
         }
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool shutdown_drained = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        bool all_done = true;
+        for (const auto& job : scans) {
+            if (!job)
+                continue;
+            for (const uint64_t id : audit_ids_for_scan(job)) {
+                if (id != job->scan_id && !active_scanner::wait_for_audit_idle(id, 0))
+                    all_done = false;
+            }
+            std::lock_guard<std::mutex> lk(job->mtx);
+            for (const auto& status : job->defensive) {
+                if (status.status != "complete" && status.status != "cancelled" && status.status != "error") {
+                    all_done = false;
+                    break;
+                }
+            }
+        }
+        if (all_done) {
+            shutdown_drained = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    if (shutdown_drained) {
+        std::lock_guard<std::mutex> lk(state().mtx);
+        state().scans.clear();
     }
     save_profiles();
 }

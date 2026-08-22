@@ -824,10 +824,10 @@ if "--aida-contract-check" in _aida_contract_sys.argv:
         _aida_safe_expansion_ok = all(_aida_pair in _aida_safe_expansion_seen for _aida_pair in _aida_safe_expansion_calls)
         _aida_context_ok = _aida_context_markers_ok and _aida_safe_expansion_ok and not _aida_context_violations
         _aida_ok = _aida_contract_ok and _aida_context_ok
-        print(_aida_contract_json.dumps({{"contract": AIDA_INITIATOR_CONTRACT_V2, "ok": _aida_ok, "params": _aida_contract_params, "has_marker_constant": AIDA_INITIATOR_CONTRACT_V2 in _aida_contract_consts, "context_viewport_sanitizer_marker": AIDA_CONTEXT_VIEWPORT_SANITIZER_V1, "context_viewport_sanitizer_ok": _aida_context_ok, "context_viewport_markers_ok": _aida_context_markers_ok, "direct_context_viewport_emulation_absent": not _aida_context_violations, "direct_context_viewport_emulation_violations": _aida_context_violations, "safe_expansion_context_creation_present": _aida_safe_expansion_ok, "safe_expansion_context_creation_seen": sorted(":".join(_aida_pair) for _aida_pair in _aida_safe_expansion_seen)}}, sort_keys=True))
+        print(_aida_contract_json.dumps({{"runtime_marker": "AIDA_CAMOUFOX_RUNTIME_CONTRACT_OK", "contract": AIDA_INITIATOR_CONTRACT_V2, "ok": _aida_ok, "initiator_params": _aida_contract_params, "has_marker_constant": AIDA_INITIATOR_CONTRACT_V2 in _aida_contract_consts, "context_viewport_sanitizer_marker": AIDA_CONTEXT_VIEWPORT_SANITIZER_V1, "context_viewport_sanitizer_ok": _aida_context_ok, "context_viewport_markers_ok": _aida_context_markers_ok, "direct_context_viewport_emulation_absent": not _aida_context_violations, "direct_context_viewport_emulation_violations": _aida_context_violations, "safe_expansion_context_creation_present": _aida_safe_expansion_ok, "safe_expansion_context_creation_seen": sorted(":".join(_aida_pair) for _aida_pair in _aida_safe_expansion_seen)}}, sort_keys=True))
         raise SystemExit(0 if _aida_ok else 2)
     except Exception as _aida_contract_exc:
-        print(_aida_contract_json.dumps({{"contract": AIDA_INITIATOR_CONTRACT_V2, "ok": False, "error_type": type(_aida_contract_exc).__name__, "error": str(_aida_contract_exc)[:500]}}, sort_keys=True))
+        print(_aida_contract_json.dumps({{"runtime_marker": "AIDA_CAMOUFOX_RUNTIME_CONTRACT_OK", "contract": AIDA_INITIATOR_CONTRACT_V2, "ok": False, "initiator_params": [], "error_type": type(_aida_contract_exc).__name__, "error": str(_aida_contract_exc)[:500]}}, sort_keys=True))
         raise SystemExit(3)
 
 '''

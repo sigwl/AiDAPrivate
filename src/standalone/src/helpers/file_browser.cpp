@@ -94,6 +94,83 @@ std::string normalized_explorer_path(const std::string& input)
 	return value;
 }
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+bool native_path_has_reparse_point(const fs::path& path)
+{
+    const std::wstring native = path.wstring();
+    if (native.empty()) return true;
+    const DWORD attributes = GetFileAttributesW(native.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+}
+
+std::string final_native_path_utf8(const fs::path& path, bool directory)
+{
+    const std::wstring native = path.wstring();
+    if (native.empty()) return {};
+    const DWORD flags = directory ? FILE_FLAG_BACKUP_SEMANTICS : FILE_ATTRIBUTE_NORMAL;
+    HANDLE handle = CreateFileW(native.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, flags, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return {};
+    std::wstring final_path;
+    const DWORD needed = GetFinalPathNameByHandleW(handle, nullptr, 0, FILE_NAME_NORMALIZED);
+    if (needed != 0) {
+        final_path.resize(needed);
+        const DWORD written = GetFinalPathNameByHandleW(handle, final_path.data(), needed, FILE_NAME_NORMALIZED);
+        if (written == 0 || written >= needed)
+            final_path.clear();
+        else
+            final_path.resize(written);
+    }
+    CloseHandle(handle);
+    if (final_path.rfind(L"\\\\?\\UNC\\", 0) == 0)
+        final_path = L"\\\\" + final_path.substr(8);
+    else if (final_path.rfind(L"\\\\?\\", 0) == 0)
+        final_path.erase(0, 4);
+    if (final_path.empty()) return {};
+    return explorer_path_to_utf8(fs::path(final_path).lexically_normal());
+}
+
+bool path_is_within_root(const std::string& candidate, const std::string& root)
+{
+    const std::string c = normalized_explorer_path(candidate);
+    const std::string r = normalized_explorer_path(root);
+    return !c.empty() && !r.empty() && (c == r ||
+        (c.size() > r.size() && c.compare(0, r.size(), r) == 0 && c[r.size()] == '/'));
+}
+
+bool admitted_file_open_path(const std::string& path, bool directory, std::string* error = nullptr)
+{
+    if (path.empty()) {
+        if (error) *error = "empty path";
+        return false;
+    }
+    const fs::path candidate = explorer_path_from_utf8(path);
+    fs::path component = candidate;
+    while (!component.empty()) {
+        if (native_path_has_reparse_point(component)) {
+            if (error) *error = "reparse point rejected";
+            return false;
+        }
+        const fs::path parent = component.parent_path();
+        if (parent == component) break;
+        component = parent;
+    }
+    const std::string final_path = final_native_path_utf8(candidate, directory);
+    if (final_path.empty()) {
+        if (error) *error = "path could not be opened for verification";
+        return false;
+    }
+    for (const auto& root : file_browser::roots) {
+        if (path_is_within_root(final_path, root))
+            return true;
+    }
+    if (error) *error = "path is outside the configured workspace roots";
+    return false;
+}
+#endif
+
 }
 
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -287,12 +364,12 @@ void file_browser::refresh(const std::string& dir)
         root = buf;
     }
     if (!root.empty()) {
-        roots = {fs::path(root).lexically_normal().string()};
+        roots = {fs::absolute(fs::path(root)).lexically_normal().string()};
         expanded_paths.clear();
         expanded_paths.insert(normalized_explorer_path(roots.front()));
     }
     else if (roots.empty() && !current_dir.empty()) {
-        roots = {fs::path(current_dir).lexically_normal().string()};
+        roots = {fs::absolute(fs::path(current_dir)).lexically_normal().string()};
         expanded_paths.insert(normalized_explorer_path(roots.front()));
     }
     if (roots.empty())
@@ -1335,6 +1412,14 @@ void open_path(const std::string& path)
     if (!aida::ui_thread::require_owner("file_browser", "open_path", "entry"))
         return;
 
+    std::string admission_error;
+    std::error_code admission_ec;
+    const bool is_directory = fs::is_directory(path, admission_ec) && !admission_ec;
+    if (!admitted_file_open_path(path, is_directory, &admission_error)) {
+        diag::log_tagged_fmt("file_open", "open_path rejected path=%s reason=%s", path.c_str(), admission_error.c_str());
+        return;
+    }
+
     std::error_code ec;
     if (fs::is_directory(path, ec) && !ec) {
         diag::log_tagged_fmt("file_browser", "open_path directory=%s", path.c_str());
@@ -1647,6 +1732,14 @@ void request_open_confirmation(const std::string& path)
     }
     if (!aida::ui_thread::require_owner("file_browser", "request_open_confirmation", "entry"))
         return;
+
+    std::string admission_error;
+    std::error_code admission_ec;
+    const bool is_directory = fs::is_directory(path, admission_ec) && !admission_ec;
+    if (!admitted_file_open_path(path, is_directory, &admission_error)) {
+        diag::log_tagged_fmt("file_open", "explorer_confirm_rejected path=%s reason=%s", path.c_str(), admission_error.c_str());
+        return;
+    }
 
     std::error_code ec;
     if (fs::is_directory(path, ec) && !ec) {

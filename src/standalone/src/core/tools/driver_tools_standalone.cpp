@@ -3846,7 +3846,6 @@ void DeferredActionManager::watcher_thread_func(int action_id)
             std::uint32_t pid = 0;
             if (poll_process_start(action->target_name, pid))
             {
-                condition_met = true;
                 trigger_context["pid"] = std::to_string(pid);
 
 
@@ -3855,16 +3854,19 @@ void DeferredActionManager::watcher_thread_func(int action_id)
 
                 if (device && device->is_connected())
                 {
-                    device->clear_process_context();
-                    device->set_process_id(pid);
-                    std::uint64_t img_base = device->find_image();
-                    device->solve_dtb();
+                    if (device->clear_process_context() && device->set_process_id(pid)) {
+                        condition_met = true;
+                        std::uint64_t img_base = device->find_image();
+                        device->solve_dtb();
 
-                    std::ostringstream base_ss;
-                    base_ss << "0x" << std::hex << std::uppercase << img_base;
-                    trigger_context["base_address"] = base_ss.str();
-                    trigger_context["pid"] = std::to_string(device->get_process_id());
+                        std::ostringstream base_ss;
+                        base_ss << "0x" << std::hex << std::uppercase << img_base;
+                        trigger_context["base_address"] = base_ss.str();
+                        trigger_context["pid"] = std::to_string(device->get_process_id());
+                    }
                 }
+                if (!device || !device->is_connected())
+                    condition_met = true;
 
                 {
                     std::lock_guard<std::mutex> lock(_mutex);

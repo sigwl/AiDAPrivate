@@ -821,7 +821,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		render_stat_pod(dl, rwx_pos.x, rwx_pos.y, pod_w, stat_pod_h, "RWX",
 			buf, rwx_count > 0 ? t.error : t.success, alpha);
 
-		const std::string val = pid != 0 ? "PID " + std::to_string(pid) : "—";
+		const std::string val = pid != 0 ? "PID " + std::to_string(pid) : "-";
 		const ImVec2 attached_pos = pod_position(3);
 		render_stat_pod(dl, attached_pos.x, attached_pos.y, pod_w, stat_pod_h, "ATTACHED", val.c_str(),
 			pid != 0 ? t.success : t.text_dim, alpha);

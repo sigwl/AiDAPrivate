@@ -141,19 +141,19 @@ struct co_init_scope_t {
 
 std::string narrow_utf8(const std::wstring& w) {
 	if (w.empty()) return {};
-	int needed = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
-	if (needed <= 1) return {};
-	std::string out(static_cast<size_t>(needed - 1), '\0');
-	WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, out.data(), needed, nullptr, nullptr);
+	int needed = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+	if (needed <= 0) return {};
+	std::string out(static_cast<size_t>(needed), '\0');
+	WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), out.data(), needed, nullptr, nullptr);
 	return out;
 }
 
 std::wstring widen_utf8(const std::string& s) {
 	if (s.empty()) return {};
-	int needed = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-	if (needed <= 1) return {};
-	std::wstring out(static_cast<size_t>(needed - 1), L'\0');
-	MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, out.data(), needed);
+	int needed = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+	if (needed <= 0) return {};
+	std::wstring out(static_cast<size_t>(needed), L'\0');
+	MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), needed);
 	return out;
 }
 
@@ -770,7 +770,9 @@ void spawn_watchdog_kill(HANDLE process_handle, HANDLE job_handle, uint32_t sec,
 		"watchdog installed pid=%u timeout_sec=%u dup_proc=%p dup_job=%p",
 		pid, sec, dup_proc, dup_job);
 
-	const uint32_t timeout_ms = sec * 1000u;
+	const uint32_t timeout_ms = sec > (INFINITE - 1u) / 1000u
+		? INFINITE - 1u
+		: sec * 1000u;
 	uint32_t local_pid = pid;
 	try {
 		const ULONGLONG post_ms = GetTickCount64();
@@ -1181,6 +1183,7 @@ bool launch_appcontainer(const launch_options_t& opts, launch_result_t& out) {
 		return false;
 	}
 	std::wstring profile_name(name_buf);
+	out.appcontainer_profile_name = profile_name;
 	std::wstring display_name = L"AiDA Run Target";
 	std::wstring description = L"Ephemeral AppContainer profile created by AiDAStandalone.";
 
@@ -1518,6 +1521,7 @@ bool launch_jobbed(const launch_options_t& opts, launch_result_t& out, bool /*in
 		cp_ok ? pi.hThread : nullptr,
 		static_cast<unsigned long>(cp_gle));
 	if (!cp_ok) {
+		out.win32_error = cp_gle;
 		out.error = format_error("CreateProcessW", cp_gle);
 		log_fail("CreateProcessW", cp_gle);
 		CloseHandle(job);
@@ -2038,12 +2042,24 @@ bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) 
 		/ L"AiDAStandalone" / L"RunTarget"
 		/ std::to_wstring(GetCurrentProcessId())
 		/ std::to_wstring(tick);
+	auto remove_failed_session = [&]() {
+		std::error_code remove_ec;
+		const uintmax_t removed = std::filesystem::remove_all(session_dir, remove_ec);
+		diag::log_tagged_critical_fmt("run_target",
+			"launch_windows_sandbox failure_cleanup session_dir='%s' removed=%llu ok=%d ec=%d msg='%s'",
+			narrow_utf8(session_dir.wstring()).c_str(),
+			static_cast<unsigned long long>(removed),
+			remove_ec ? 0 : 1,
+			remove_ec.value(),
+			remove_ec.message().c_str());
+	};
 	std::filesystem::create_directories(session_dir, ec);
 	if (ec) {
 		out.error = "Failed to create session directory.";
 		diag::log_tagged_critical_fmt("run_target",
 			"launch_windows_sandbox create_session_dir_FAILED ec=%d msg='%s'",
 			ec.value(), ec.message().c_str());
+		remove_failed_session();
 		return false;
 	}
 
@@ -2054,6 +2070,7 @@ bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) 
 		diag::log_tagged_critical_fmt("run_target",
 			"launch_windows_sandbox create_input_dir_FAILED ec=%d msg='%s'",
 			ec.value(), ec.message().c_str());
+		remove_failed_session();
 		return false;
 	}
 
@@ -2064,6 +2081,7 @@ bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) 
 		diag::log_tagged_critical_fmt("run_target",
 			"launch_windows_sandbox create_output_dir_FAILED ec=%d msg='%s'",
 			ec.value(), ec.message().c_str());
+		remove_failed_session();
 		return false;
 	}
 
@@ -2077,9 +2095,10 @@ bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) 
 		out.error = "Failed to stage target executable for Windows Sandbox.";
 		diag::log_tagged_critical_fmt("run_target",
 			"launch_windows_sandbox copy_target_FAILED src='%s' dst='%s' ec=%d msg='%s'",
-			narrow_utf8(exe_path.wstring()).c_str(),
-			narrow_utf8(target_in_input.wstring()).c_str(),
-			ec.value(), ec.message().c_str());
+				narrow_utf8(exe_path.wstring()).c_str(),
+				narrow_utf8(target_in_input.wstring()).c_str(),
+				ec.value(), ec.message().c_str());
+		remove_failed_session();
 		return false;
 	}
 	ec.clear();
@@ -2091,9 +2110,10 @@ bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) 
 		out.error = "Failed to stage AiDA guest agent for Windows Sandbox.";
 		diag::log_tagged_critical_fmt("run_target",
 			"launch_windows_sandbox copy_guest_agent_FAILED src='%s' dst='%s' ec=%d msg='%s'",
-			narrow_utf8(guest_agent_src).c_str(),
-			narrow_utf8(host_agent.wstring()).c_str(),
-			ec.value(), ec.message().c_str());
+				narrow_utf8(guest_agent_src).c_str(),
+				narrow_utf8(host_agent.wstring()).c_str(),
+				ec.value(), ec.message().c_str());
+		remove_failed_session();
 		return false;
 	}
 	ec.clear();
@@ -2111,6 +2131,7 @@ bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) 
 		std::wofstream ofs(host_script.wstring(), std::ios::trunc);
 		if (!ofs.is_open()) {
 			out.error = "Failed to write run.ps1 in session directory.";
+			remove_failed_session();
 			return false;
 		}
 		ofs.imbue(std::locale::classic());
@@ -2156,6 +2177,7 @@ bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) 
 		std::wofstream ofs(host_wsb.wstring(), std::ios::trunc);
 		if (!ofs.is_open()) {
 			out.error = "Failed to write session.wsb in session directory.";
+			remove_failed_session();
 			return false;
 		}
 		ofs.imbue(std::locale::classic());
@@ -2214,6 +2236,7 @@ bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) 
 		DWORD gle = GetLastError();
 		out.error = format_error("CreateProcessW (WindowsSandbox.exe)", gle);
 		log_fail("CreateProcessW.WindowsSandbox", gle);
+		remove_failed_session();
 		return false;
 	}
 	diag::log_tagged_critical_fmt("run_target",
@@ -2229,6 +2252,7 @@ bool launch_windows_sandbox(const launch_options_t& opts, launch_result_t& out) 
 	out.thread_handle = 0;
 	out.job_handle = 0;
 	out.sandbox_dir = session_dir.wstring();
+	out.windows_sandbox_host_owned = true;
 	vm_guest_bridge::activate(out.sandbox_dir, opts.exe_path);
 
 	if (opts.auto_terminate_sec > 0) {
@@ -2342,35 +2366,77 @@ bool launch(const launch_options_t& opts, launch_result_t& out) {
 			"launch FAILED iso=%d error='%s'",
 			static_cast<int>(effective_opts.isolation),
 			out.error.c_str());
+		const std::string launch_error = out.error;
+		(void)cleanup(out);
+		out.error = launch_error;
 	}
 	return ok;
 }
 
 bool cleanup(launch_result_t& result) {
-	bool fw_removed = false;
+	bool fw_removed = true;
 	bool job_closed = false;
 	bool proc_closed = false;
 	bool thr_closed = false;
 	bool kernel_unregistered = false;
+	bool bridge_deactivated = false;
+	bool sandbox_host_stopped = true;
+	bool sandbox_dir_removed = true;
 
-	if (result.sandbox_pid_registered && result.pid != 0) {
-		try_unregister_kernel_sandbox_guard(result.pid);
-		kernel_unregistered = true;
-		result.sandbox_pid_registered = false;
-		result.net_logger_registered = false;
-	} else if (result.net_logger_registered && driver_bridge::is_loaded()) {
-		driver_bridge::stop_capture();
-		result.net_logger_registered = false;
-	}
-
-	if (!result.firewall_rule_name.empty()) {
-		fw_removed = firewall_remove_rule(result.firewall_rule_name);
-		result.firewall_rule_name.clear();
-	}
 	if (result.job_handle != 0) {
 		CloseHandle(reinterpret_cast<HANDLE>(result.job_handle));
 		result.job_handle = 0;
 		job_closed = true;
+	}
+	bool target_stopped = true;
+	if (result.process_handle != 0 && !result.windows_sandbox_host_owned) {
+		HANDLE process = reinterpret_cast<HANDLE>(result.process_handle);
+		DWORD wait = WaitForSingleObject(process, 5000);
+		if (wait == WAIT_TIMEOUT) {
+			const BOOL terminated = TerminateProcess(process, 0xDEADu);
+			const DWORD terminate_gle = terminated ? 0 : GetLastError();
+			if (terminated)
+				wait = WaitForSingleObject(process, 5000);
+			if (wait != WAIT_OBJECT_0) {
+				target_stopped = false;
+				result.error = terminated
+					? "Target did not stop within 5000 ms after termination request."
+					: format_error("TerminateProcess (target cleanup)", terminate_gle);
+			}
+		}
+		if (wait != WAIT_OBJECT_0) {
+			target_stopped = false;
+			if (wait == WAIT_FAILED && result.error.empty())
+				result.error = format_error("WaitForSingleObject (target cleanup)", GetLastError());
+			else if (wait == WAIT_TIMEOUT && result.error.empty())
+				result.error = "Target did not stop within 5000 ms during cleanup.";
+			diag::log_tagged_critical_fmt("run_target",
+				"cleanup target_wait FAILED pid=%u wait=0x%08lX",
+				result.pid, static_cast<unsigned long>(wait));
+		}
+	}
+	if (target_stopped) {
+		if (result.sandbox_pid_registered && result.pid != 0) {
+			try_unregister_kernel_sandbox_guard(result.pid);
+			kernel_unregistered = true;
+			result.sandbox_pid_registered = false;
+			result.net_logger_registered = false;
+		} else if (result.net_logger_registered && driver_bridge::is_loaded()) {
+			driver_bridge::stop_capture();
+			result.net_logger_registered = false;
+		}
+
+		if (!result.firewall_rule_name.empty()) {
+			fw_removed = firewall_remove_rule(result.firewall_rule_name);
+			if (fw_removed) {
+				result.firewall_rule_name.clear();
+			} else {
+				result.error = "Failed to remove firewall rule: " + result.firewall_rule_name;
+				diag::log_tagged_critical_fmt("run_target",
+					"cleanup firewall_remove FAILED rule_name='%s'",
+					result.firewall_rule_name.c_str());
+			}
+		}
 	}
 	if (result.thread_handle != 0) {
 		CloseHandle(reinterpret_cast<HANDLE>(result.thread_handle));
@@ -2378,19 +2444,108 @@ bool cleanup(launch_result_t& result) {
 		thr_closed = true;
 	}
 	if (result.process_handle != 0) {
-		CloseHandle(reinterpret_cast<HANDLE>(result.process_handle));
-		result.process_handle = 0;
-		proc_closed = true;
+		HANDLE process = reinterpret_cast<HANDLE>(result.process_handle);
+		if (result.windows_sandbox_host_owned) {
+			DWORD wait = WaitForSingleObject(process, 0);
+			if (wait == WAIT_TIMEOUT) {
+				if (!TerminateProcess(process, 0xDEAD)) {
+					DWORD gle = GetLastError();
+					wait = WaitForSingleObject(process, 0);
+					if (wait == WAIT_TIMEOUT || wait == WAIT_FAILED) {
+						sandbox_host_stopped = false;
+						result.error = format_error("TerminateProcess (WindowsSandbox.exe)", gle);
+						diag::log_tagged_critical_fmt("run_target",
+							"cleanup WindowsSandbox.exe terminate_FAILED gle=%lu wait=0x%08lX",
+							static_cast<unsigned long>(gle),
+							static_cast<unsigned long>(wait));
+					}
+				} else {
+					wait = WaitForSingleObject(process, 5000);
+					if (wait != WAIT_OBJECT_0) {
+						sandbox_host_stopped = false;
+						result.error = wait == WAIT_FAILED
+							? format_error("WaitForSingleObject (WindowsSandbox.exe)", GetLastError())
+							: "WindowsSandbox.exe did not stop within 5000 ms.";
+					}
+				}
+			} else if (wait == WAIT_FAILED) {
+				sandbox_host_stopped = false;
+				result.error = format_error("WaitForSingleObject (WindowsSandbox.exe)", GetLastError());
+			}
+		}
+		if (!result.windows_sandbox_host_owned || sandbox_host_stopped) {
+			CloseHandle(process);
+			result.process_handle = 0;
+			proc_closed = true;
+		}
 	}
+	if (!result.sandbox_dir.empty()) {
+		const auto bridge_session = vm_guest_bridge::current();
+		if (bridge_session.active && bridge_session.session_dir == result.sandbox_dir) {
+			vm_guest_bridge::deactivate();
+			bridge_deactivated = true;
+		}
+	}
+	if (result.windows_sandbox_host_owned && sandbox_host_stopped && !result.sandbox_dir.empty()) {
+		std::error_code ec;
+		const uintmax_t removed = std::filesystem::remove_all(result.sandbox_dir, ec);
+		sandbox_dir_removed = !ec;
+		if (!sandbox_dir_removed) {
+			result.error = "Failed to remove Windows Sandbox session directory: " + ec.message();
+		}
+		diag::log_tagged_critical_fmt("run_target",
+			"cleanup WindowsSandbox session_remove path='%s' removed=%llu ok=%d ec=%d msg='%s'",
+			narrow_utf8(result.sandbox_dir).c_str(),
+			static_cast<unsigned long long>(removed),
+			sandbox_dir_removed ? 1 : 0,
+			ec.value(),
+			ec.message().c_str());
+		if (sandbox_dir_removed)
+			result.sandbox_dir.clear();
+	}
+	if (result.windows_sandbox_host_owned && sandbox_host_stopped && sandbox_dir_removed)
+		result.windows_sandbox_host_owned = false;
+	if (!result.appcontainer_profile_name.empty() && target_stopped) {
+		HRESULT profile_hr = DeleteAppContainerProfile(result.appcontainer_profile_name.c_str());
+		if (FAILED(profile_hr) && profile_hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) {
+			result.error = format_error("DeleteAppContainerProfile", static_cast<DWORD>(profile_hr));
+			fw_removed = false;
+			diag::log_tagged_critical_fmt("run_target",
+				"cleanup appcontainer_profile_remove FAILED name='%ls' hr=0x%08lX",
+				result.appcontainer_profile_name.c_str(),
+				static_cast<unsigned long>(profile_hr));
+		} else {
+			result.appcontainer_profile_name.clear();
+		}
+	}
+	if (!result.sandbox_dir.empty() && !result.windows_sandbox_host_owned && target_stopped) {
+		std::error_code ec;
+		const uintmax_t removed = std::filesystem::remove_all(result.sandbox_dir, ec);
+		sandbox_dir_removed = !ec;
+		if (!sandbox_dir_removed)
+			result.error = "Failed to remove sandbox directory: " + ec.message();
+		diag::log_tagged_critical_fmt("run_target",
+			"cleanup sandbox_dir_remove path='%s' removed=%llu ok=%d ec=%d",
+			narrow_utf8(result.sandbox_dir).c_str(),
+			static_cast<unsigned long long>(removed), sandbox_dir_removed ? 1 : 0,
+			ec.value());
+		if (sandbox_dir_removed)
+			result.sandbox_dir.clear();
+	}
+	const bool ok = target_stopped && fw_removed && sandbox_host_stopped && sandbox_dir_removed;
 	diag::log_tagged_critical_fmt("run_target",
-		"cleanup ok=1 job_closed=%d proc_closed=%d thr_closed=%d firewall_removed=%d kernel_unregistered=%d sandbox_dir='%s'",
+		"cleanup ok=%d job_closed=%d proc_closed=%d thr_closed=%d firewall_removed=%d kernel_unregistered=%d bridge_deactivated=%d sandbox_host_stopped=%d sandbox_dir_removed=%d sandbox_dir='%s'",
+		ok ? 1 : 0,
 		job_closed ? 1 : 0,
 		proc_closed ? 1 : 0,
 		thr_closed ? 1 : 0,
 		fw_removed ? 1 : 0,
 		kernel_unregistered ? 1 : 0,
+		bridge_deactivated ? 1 : 0,
+		sandbox_host_stopped ? 1 : 0,
+		sandbox_dir_removed ? 1 : 0,
 		narrow_utf8(result.sandbox_dir).c_str());
-	return true;
+	return ok;
 }
 
 }

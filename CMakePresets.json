@@ -4,8 +4,8 @@
   "configurePresets": [
     {
       "name": "ninja-msvc-release",
-      "displayName": "Ninja + MSVC + sccache (RELEASE)",
-      "description": "Canonical production build. Ninja drives the build graph (single-graph parallelism beats per-vcxproj /m), sccache caches every .obj keyed on preprocessed input (second clean rebuild is mostly cache hits), /Z7 embeds debug info via CMP0141 (no mspdbsrv.exe serialization). This is the only supported build configuration. Run from a 'x64 Native Tools Command Prompt for VS 2022' so cl.exe is on PATH, or use the VS Code task which calls vcvars64.bat first.",
+      "displayName": "Ninja + MSVC (RELEASE, sccache disabled)",
+      "description": "Canonical production build. Ninja drives the build graph (single-graph parallelism beats per-vcxproj /m), sccache is disabled, and /Z7 embeds debug info via CMP0141 (no mspdbsrv.exe serialization). This is the only supported build configuration. Run from a 'x64 Native Tools Command Prompt for VS 2022' so cl.exe is on PATH, or use the VS Code task which calls vcvars64.bat first.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build-ninja",
       "cacheVariables": {
@@ -20,10 +20,7 @@
         "BUILD_AIDA_PLUGIN": "OFF"
       },
       "environment": {
-        "SCCACHE_DIR":             "${sourceDir}/.sccache",
-        "SCCACHE_CACHE_SIZE":      "20G",
-        "SCCACHE_IDLE_TIMEOUT":    "0",
-        "SCCACHE_DISABLE":         "1"
+        "SCCACHE_DISABLE": "1"
       }
     }
   ],

@@ -933,9 +933,10 @@ inline void validate_uniqueness_process(signature_t& sig)
 	sub.domain = aida::infra::executor::domain_t::long_running;
 	sub.priority = 2;
 	sub.target_pid = driver_bridge::attached_pid();
-	sub.body = [sig_copy = sig]() mutable {
+	const uint32_t target_pid = sub.target_pid;
+	sub.body = [sig_copy = sig, target_pid]() mutable {
 		int total_count = 0;
-		auto regions = driver_bridge::enumerate_memory_regions(4096);
+		auto regions = driver_bridge::enumerate_memory_regions_for(target_pid, 4096);
 
 		for (auto& region : regions) {
 			if (region.state != 0x1000) continue;
@@ -945,8 +946,9 @@ inline void validate_uniqueness_process(signature_t& sig)
 			if (region.size > 0x10000000) continue;
 
 			std::vector<uint8_t> data;
-			driver_bridge::read_memory(region.base, static_cast<size_t>(region.size), data);
-			if (data.empty()) continue;
+			if (!driver_bridge::read_memory_for(target_pid, region.base,
+				static_cast<size_t>(region.size), data) ||
+				data.size() != static_cast<size_t>(region.size)) continue;
 
 			total_count += detail::count_pattern_in_data(data.data(), data.size(), sig_copy.bytes);
 			if (total_count > 1) break;
@@ -1074,12 +1076,13 @@ inline void generate_batch(const std::vector<uint64_t>& addresses, int num_instr
 	sub.domain = aida::infra::executor::domain_t::feature_worker;
 	sub.priority = 2;
 	sub.target_pid = driver_bridge::attached_pid();
-	sub.body = [addrs, num_instructions, auto_wildcard]() {
+	const uint32_t target_pid = sub.target_pid;
+	sub.body = [addrs, num_instructions, auto_wildcard, target_pid]() {
 		auto t_start = std::chrono::steady_clock::now();
 		ZydisDecoder decoder;
 		ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
 
-		auto modules = driver_bridge::enumerate_modules();
+		auto modules = driver_bridge::enumerate_modules_for(target_pid);
 
 		for (size_t ai = 0; ai < addrs.size(); ++ai) {
 			uint64_t address = addrs[ai];
@@ -1097,8 +1100,7 @@ inline void generate_batch(const std::vector<uint64_t>& addresses, int num_instr
 
 			size_t read_size = static_cast<size_t>(num_instructions) * 15;
 			std::vector<uint8_t> code;
-			driver_bridge::read_memory(address, read_size, code);
-			if (code.empty()) {
+			if (!driver_bridge::read_memory_for(target_pid, address, read_size, code) || code.empty()) {
 				g_state.batch_done.fetch_add(1);
 				continue;
 			}

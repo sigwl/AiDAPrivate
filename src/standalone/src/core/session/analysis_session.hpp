@@ -50,6 +50,7 @@ struct analysis_session_t {
     aida::analysis::cancellation_source_t load_cancellation;
     std::optional<std::uint64_t> open_task_id;
     std::optional<aida::infra::taskflow_runtime::job_handle_t> baseline_job;
+    std::uint64_t load_generation = 1;
     session_load_state_t load_state = session_load_state_t::opening;
     std::optional<aida::analysis::workspace_error_t> load_error;
 };

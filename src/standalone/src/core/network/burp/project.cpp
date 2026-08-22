@@ -11,6 +11,7 @@
 #include "active_scanner.hpp"
 #include "burp_logger.hpp"
 #include "collaborator.hpp"
+#include "content_discovery.hpp"
 #include "cookie_jar.hpp"
 #include "crawl_audit.hpp"
 #include "crawler.hpp"
@@ -389,6 +390,14 @@ json audit_status_to_json(const active_scanner::audit_status_t& st)
 
 json crawler_status_to_json(const crawler::crawl_status_t& st)
 {
+    const char* phase = "unknown";
+    switch (st.phase) {
+    case crawler::crawl_status_phase_t::pending: phase = "pending"; break;
+    case crawler::crawl_status_phase_t::running: phase = "running"; break;
+    case crawler::crawl_status_phase_t::stopping: phase = "stopping"; break;
+    case crawler::crawl_status_phase_t::complete: phase = "complete"; break;
+    case crawler::crawl_status_phase_t::error: phase = "error"; break;
+    }
     json discovered = json::array();
     for (const auto& d : st.discovered) {
         discovered.push_back({
@@ -403,6 +412,7 @@ json crawler_status_to_json(const crawler::crawl_status_t& st)
     }
     return {
         {"id", st.id},
+        {"phase", phase},
         {"queue_depth", st.queue_depth},
         {"pages_visited", st.pages_visited},
         {"pages_failed", st.pages_failed},
@@ -412,10 +422,56 @@ json crawler_status_to_json(const crawler::crawl_status_t& st)
         {"last_progress_unix_ms", st.last_progress_unix_ms},
         {"pages_per_sec", st.pages_per_sec},
         {"in_flight", st.in_flight},
+        {"finished", st.finished},
+        {"cancelled", st.cancelled},
         {"last_url", st.last_url},
         {"last_error", st.last_error},
         {"discovered", std::move(discovered)},
         {"log", st.log}
+    };
+}
+
+json content_discovery_status_to_json(const content_discovery::disc_status_t& st)
+{
+    const char* phase = "unknown";
+    switch (st.phase) {
+    case content_discovery::disc_phase_t::pending: phase = "pending"; break;
+    case content_discovery::disc_phase_t::calibrating: phase = "calibrating"; break;
+    case content_discovery::disc_phase_t::running: phase = "running"; break;
+    case content_discovery::disc_phase_t::stopping: phase = "stopping"; break;
+    case content_discovery::disc_phase_t::complete: phase = "complete"; break;
+    case content_discovery::disc_phase_t::error: phase = "error"; break;
+    }
+    json hits = json::array();
+    for (const auto& hit : st.hits_list) {
+        hits.push_back({
+            {"url", hit.url},
+            {"payload", hit.payload},
+            {"status", hit.status},
+            {"body_bytes", hit.body_bytes},
+            {"latency_ms", hit.latency_ms},
+            {"content_type", hit.content_type},
+            {"redirect_to", hit.redirect_to},
+            {"depth", hit.depth}
+        });
+    }
+    return {
+        {"id", st.id},
+        {"phase", phase},
+        {"attempts", st.attempts},
+        {"total", st.total},
+        {"hits", st.hits},
+        {"filtered", st.filtered},
+        {"errors", st.errors},
+        {"started_unix_ms", st.started_unix_ms},
+        {"finished_unix_ms", st.finished_unix_ms},
+        {"finished", st.finished},
+        {"cancelled", st.cancelled},
+        {"calibrated_size_lo", st.calibrated_size_lo},
+        {"calibrated_size_hi", st.calibrated_size_hi},
+        {"last_error", st.last_error},
+        {"last_url", st.last_url},
+        {"results", std::move(hits)}
     };
 }
 
@@ -521,6 +577,11 @@ nlohmann::json export_json()
     json crawls = json::array();
     for (const auto& crawl : crawler::list()) crawls.push_back(crawler_status_to_json(crawl));
     root["crawler"] = {{"crawls", std::move(crawls)}};
+
+    json discoveries = json::array();
+    for (const auto& discovery : content_discovery::list())
+        discoveries.push_back(content_discovery_status_to_json(discovery));
+    root["content_discovery"] = {{"jobs", std::move(discoveries)}};
 
     root["crawl_audit"] = crawl_audit::export_json();
     root["collaborator"] = collaborator::export_json();

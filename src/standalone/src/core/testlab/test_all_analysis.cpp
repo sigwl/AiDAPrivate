@@ -5698,7 +5698,7 @@ static HANDLE duplicate_analysis_log_handle(HANDLE hf) {
 }
 
 static bool run_analysis_test_bounded(HANDLE hf, const analysis_test_entry_t& test, std::atomic<int>& passed, std::atomic<int>& failed, DWORD timeout_ms) {
-    static test_lab::bounded_runner_t runner(4);
+    static test_lab::bounded_runner_t runner(1);
     auto state = std::make_shared<analysis_worker_state_t>();
 
     auto worker_log = std::make_shared<analysis_log_handle_t>(duplicate_analysis_log_handle(hf));

@@ -991,11 +991,14 @@ workspace_result_t<bool> reopen_persisted_analysis(
     return workspace_result_t<bool>::success(true);
 }
 
-void record_load_failure(const std::string& session_id, workspace_error_t error)
+void record_load_failure(const std::string& session_id,
+                         std::uint64_t load_generation,
+                         workspace_error_t error)
 {
     std::lock_guard<std::mutex> lock(state().mutex);
     for (const auto& session : state().sessions) {
-        if (session->id != session_id) continue;
+        if (session->id != session_id || session->load_generation != load_generation ||
+            session->load_cancellation.token().stop_requested()) continue;
         session->open_task_id.reset();
         session->load_state = session_load_state_t::failed;
         session->load_error = std::move(error);
@@ -2082,6 +2085,7 @@ void submit_pdb_restore(const std::string& session_id,
 }
 
 bool bind_workspace(const std::string& session_id,
+                    std::uint64_t load_generation,
                     const std::shared_ptr<analysis_workspace_t>& workspace,
                     std::optional<aida::infra::taskflow_runtime::job_handle_t> baseline_job,
                     session_load_state_t load_state)
@@ -2095,7 +2099,9 @@ bool bind_workspace(const std::string& session_id,
         std::lock_guard<std::mutex> lock(state().mutex);
         size_t target_index = static_cast<size_t>(-1);
         for (size_t index = 0; index < state().sessions.size(); ++index) {
-            if (state().sessions[index]->id == session_id) {
+            if (state().sessions[index]->id == session_id &&
+                state().sessions[index]->load_generation == load_generation &&
+                !state().sessions[index]->load_cancellation.token().stop_requested()) {
                 target_index = index;
                 break;
             }
@@ -2141,6 +2147,16 @@ bool bind_workspace(const std::string& session_id,
             selected = state().active_idx == static_cast<int>(target_index);
         }
     }
+    if (!merged) {
+        std::lock_guard<std::mutex> lock(state().mutex);
+        const auto current = std::find_if(state().sessions.begin(), state().sessions.end(),
+            [&](const auto& session) {
+                return session->id == session_id &&
+                    session->load_generation == load_generation &&
+                    !session->load_cancellation.token().stop_requested();
+            });
+        if (current == state().sessions.end()) return false;
+    }
     if (merged) {
         loading_binary_overlay::release_session(merged_session_id);
         if (selected) {
@@ -2179,7 +2195,7 @@ bool bind_workspace(const std::string& session_id,
             auto error = make_workspace_error(workspace_error_code_t::limit_exceeded,
                 "Workspace symbol paths exceed bounded storage limits",
                 "analysis_session.bind_workspace");
-            record_load_failure(session_id, std::move(error));
+            record_load_failure(session_id, load_generation, std::move(error));
             return false;
         }
         initialize_pdb_prompt(workspace, pdb_state);
@@ -2195,19 +2211,20 @@ bool bind_workspace(const std::string& session_id,
         const auto selection = workspace_registry().select_for_ui(
             workspace->identity().binary_id());
         if (!selection) {
-            record_load_failure(session_id, selection.error());
+            record_load_failure(session_id, load_generation, selection.error());
             return false;
         }
     }
     return workspace_for_session_id(session_id) != nullptr;
 }
 
-void static_open_worker(std::string session_id, std::string path,
+void static_open_worker(std::string session_id, std::uint64_t load_generation,
+                        std::string path,
                         cancellation_token_t cancel)
 {
     auto acquired = acquire_static_workspace(path, cancel);
     if (!acquired) {
-        record_load_failure(session_id, acquired.error());
+        record_load_failure(session_id, load_generation, acquired.error());
         return;
     }
     auto result = acquired.take_value();
@@ -2217,7 +2234,7 @@ void static_open_worker(std::string session_id, std::string path,
         readiness == workspace_readiness_t::partial
             ? session_load_state_t::ready
             : session_load_state_t::analyzing;
-    if (!bind_workspace(session_id, result.workspace,
+    if (!bind_workspace(session_id, load_generation, result.workspace,
                         std::move(result.analysis_job), load_state)) {
         if (!workspace_for_session_id(session_id) && !result.joined_existing) {
             static_cast<void>(
@@ -2910,20 +2927,16 @@ bool open_session(const std::string& path)
         return false;
     }
     std::string session_id;
+    std::uint64_t load_generation = 0;
     cancellation_token_t cancel;
-    std::shared_ptr<analysis_workspace_t> existing_workspace;
     bool existing_session = false;
+    size_t existing_index = 0;
     {
         std::lock_guard<std::mutex> lock(state().mutex);
         for (size_t index = 0; index < state().sessions.size(); ++index) {
             if (!paths_equal(state().sessions[index]->path, path)) continue;
             existing_session = true;
-            state().active_idx = static_cast<int>(index);
-            state().sessions[index]->last_active_steady_ms = now_steady_ms();
-            for (auto& s : state().sessions)
-                s->ui_selected = false;
-            state().sessions[index]->ui_selected = true;
-            existing_workspace = state().sessions[index]->workspace;
+            existing_index = index;
             break;
         }
         if (!existing_session) {
@@ -2940,6 +2953,7 @@ bool open_session(const std::string& path)
             session->last_active_steady_ms = now_steady_ms();
             session->ui_selected = true;
             session_id = session->id;
+            load_generation = session->load_generation;
             cancel = session->load_cancellation.token();
             for (auto& existing_session : state().sessions)
                 existing_session->ui_selected = false;
@@ -2948,15 +2962,7 @@ bool open_session(const std::string& path)
         }
     }
     if (existing_session) {
-        if (existing_workspace) {
-            const auto selected = workspace_registry().select_for_ui(
-                existing_workspace->identity().binary_id());
-            if (!selected) {
-                std::lock_guard<std::mutex> lock(state().mutex);
-                state().last_error = selected.error().stable_code();
-            }
-        }
-        return false;
+        return activate_session_transaction(existing_index, nullptr);
     }
     loading_binary_overlay::track_session(session_id, path,
         loading_binary_overlay::completion_action_t::switch_to_disassembly_or_hex);
@@ -2970,15 +2976,16 @@ bool open_session(const std::string& path)
     submission.thread_class = "bounded_task";
     submission.domain = aida::infra::executor::domain_t::feature_worker;
     submission.priority = 3;
-    submission.body = [session_id, path, cancel]() mutable {
-        static_open_worker(std::move(session_id), std::move(path), std::move(cancel));
+    submission.body = [session_id, load_generation, path, cancel]() mutable {
+        static_open_worker(std::move(session_id), load_generation,
+            std::move(path), std::move(cancel));
     };
     const auto submitted = aida::infra::executor::submit(std::move(submission));
     if (!submitted.submitted) {
         auto error = make_workspace_error(workspace_error_code_t::provider_unavailable,
             "Static workspace open task was rejected", "analysis_session.open");
         error.details.emplace_back("reason", submitted.reject_reason);
-        record_load_failure(session_id, std::move(error));
+        record_load_failure(session_id, load_generation, std::move(error));
         return false;
     }
     bool session_present = false;
@@ -3427,6 +3434,8 @@ bool cancel_session(size_t idx)
         }
         auto& session = *state().sessions[idx];
         session.load_cancellation.request_cancel();
+        if (session.load_generation != UINT64_MAX)
+            ++session.load_generation;
         workspace = session.workspace;
         open_task_id = session.open_task_id;
         baseline_job = session.baseline_job;
@@ -3487,6 +3496,8 @@ bool close_session(size_t idx)
         }
         auto session = state().sessions[idx];
         session->load_cancellation.request_cancel();
+        if (session->load_generation != UINT64_MAX)
+            ++session->load_generation;
         session->load_state = session_load_state_t::closing;
         workspace = session->workspace;
         pid = session->attached_pid;

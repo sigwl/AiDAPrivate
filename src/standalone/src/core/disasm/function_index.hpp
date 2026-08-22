@@ -1192,9 +1192,10 @@ namespace function_index {
 
 		inline bool read_routed_bytes(uint64_t va, size_t len, std::vector<uint8_t>& out) {
 			out.clear();
-			if (driver_bridge::attached_pid() == 0 || len == 0 || len > 64 * 1024 * 1024)
+			const uint32_t pid = driver_bridge::attached_pid();
+			if (pid == 0 || len == 0 || len > 64 * 1024 * 1024)
 				return false;
-			return driver_bridge::read_memory(va, len, out) && out.size() == len;
+			return driver_bridge::read_memory_for(pid, va, len, out) && out.size() == len;
 		}
 
 		inline bool read_live_runtime_function_table(uint64_t module_base,

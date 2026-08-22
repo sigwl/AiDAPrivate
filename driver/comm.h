@@ -1088,7 +1088,7 @@ namespace voyager {
 
         bool connect() noexcept;
         void disconnect() noexcept;
-        void clear_process_context() noexcept;
+        bool clear_process_context() noexcept;
         [[nodiscard]] bool is_connected() const noexcept { return driver_handle_ != INVALID_HANDLE_VALUE; }
 
         std::uint32_t find_process(const char* process_name) noexcept;
@@ -1568,7 +1568,7 @@ namespace voyager {
         [[nodiscard]] DWORD get_last_connect_error() const noexcept { return last_connect_error_; }
         [[nodiscard]] detail::raw_ioctl_telemetry get_last_raw_ioctl_telemetry() const noexcept { return last_raw_ioctl_; }
 
-        void set_process_id(std::uint32_t pid) noexcept;
+        bool set_process_id(std::uint32_t pid) noexcept;
         void set_base_address(std::uint64_t base) noexcept { base_address_ = base; }
         void set_dtb(std::uint64_t dtb) noexcept { dtb_ = dtb; }
         void set_kernel_dtb(std::uint64_t dtb) noexcept { kernel_dtb_ = dtb; }

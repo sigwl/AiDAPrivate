@@ -57,10 +57,22 @@ struct cookie_changed_t
     std::string action;
 };
 
+struct job_state_changed_t
+{
+    std::string job_type;
+    uint64_t    job_id = 0;
+    std::string phase;
+    std::string reason;
+    uint64_t    timestamp_ms = 0;
+    bool        cancelled = false;
+    bool        terminal = false;
+};
+
 inline constexpr aida::events::event_def_t<exchange_observed_t> kExchangeObservedEvent{"burp.exchange_observed"};
 inline constexpr aida::events::event_def_t<send_to_action_t>    kSendToActionEvent{"burp.send_to_action"};
 inline constexpr aida::events::event_def_t<scope_changed_t>     kScopeChangedEvent{"burp.scope_changed"};
 inline constexpr aida::events::event_def_t<cookie_changed_t>    kCookieChangedEvent{"burp.cookie_changed"};
+inline constexpr aida::events::event_def_t<job_state_changed_t> kJobStateChangedEvent{"burp.job_state_changed"};
 
 }
 }

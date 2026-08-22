@@ -170,6 +170,7 @@ struct state_t {
 };
 
 inline state_t g_state;
+inline std::mutex g_phase_execution_mutex;
 
 inline nlohmann::json status_json();
 inline uint64_t context_dr_address(const driver_bridge::thread_context_t& ctx, uint32_t slot);
@@ -235,6 +236,18 @@ struct phase_result_t {
     std::string exception;
     std::string exception_category;
 };
+
+struct phase_cancel_t {
+    std::atomic_bool requested{false};
+};
+
+template <typename Fn>
+decltype(auto) invoke_phase(Fn& fn, phase_cancel_t& cancel) {
+    if constexpr (std::is_invocable_v<Fn&, phase_cancel_t&>)
+        return fn(cancel);
+    else
+        return fn();
+}
 
 template <typename T, typename Fn>
 inline phase_result_t<T> run_phase_inline(const char* phase,
@@ -304,11 +317,12 @@ inline phase_result_t<T> run_phase_inline(const char* phase,
 
 template <typename T, typename Fn>
 inline phase_result_t<T> run_phase_with_timeout(const char* phase,
-                                                uint32_t pid,
-                                                uint32_t timeout_ms,
-                                                Fn&& fn) {
+                                                 uint32_t pid,
+                                                 uint32_t timeout_ms,
+                                                 Fn&& fn) {
     const uint64_t started_ms = GetTickCount64();
     const DWORD caller_tid = GetCurrentThreadId();
+    const std::string phase_name = phase ? phase : "unknown";
     diag::log_tagged_fmt("api_monitor",
         "phase_begin phase=%s pid=%u backend=executor.diagnostics caller_tid=%lu timeout_ms=%u",
         phase,
@@ -319,18 +333,25 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
 
     auto promise = std::make_shared<std::promise<phase_result_t<T>>>();
     auto fn_copy = std::make_shared<typename std::decay<Fn>::type>(std::forward<Fn>(fn));
-    auto phase_timed_out = std::make_shared<std::atomic_bool>(false);
+    auto cancel = std::make_shared<phase_cancel_t>();
     auto timeout_elapsed = std::make_shared<std::atomic<uint64_t>>(0);
     std::future<phase_result_t<T>> future = promise->get_future();
 
-    auto worker_body = [promise, fn_copy, phase_timed_out, timeout_elapsed, phase, pid, timeout_ms, started_ms](const char* backend) mutable {
+    auto worker_body = [promise, fn_copy, cancel, timeout_elapsed, phase_name, pid, timeout_ms, started_ms](const char* backend) mutable {
         const DWORD worker_tid = GetCurrentThreadId();
         phase_result_t<T> result;
         result.completed = true;
         try {
             SetLastError(ERROR_SUCCESS);
-            result.value = (*fn_copy)();
-            result.gle = GetLastError();
+            std::unique_lock<std::mutex> phase_lock(g_phase_execution_mutex);
+            if (cancel->requested.load(std::memory_order_acquire)) {
+                result.completed = false;
+                result.gle = ERROR_CANCELLED;
+                result.exception = "phase cancelled before worker execution";
+            } else {
+                result.value = invoke_phase(*fn_copy, *cancel);
+                result.gle = GetLastError();
+            }
         } catch (const std::system_error& ex) {
             result.threw = true;
             result.exception = ex.what();
@@ -347,10 +368,10 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
             result.gle = GetLastError();
         }
         result.elapsed_ms = GetTickCount64() - started_ms;
-        const bool late = phase_timed_out->load(std::memory_order_acquire);
+        const bool late = cancel->requested.load(std::memory_order_acquire);
         diag::log_tagged_fmt("api_monitor",
             "phase_worker_exit phase=%s pid=%u backend=%s worker_tid=%lu elapsed_ms=%llu gle=%lu threw=%d code=%d category=%s late=%d timeout_elapsed_ms=%llu",
-            phase,
+            phase_name.c_str(),
             pid,
             backend ? backend : "executor",
             worker_tid,
@@ -364,7 +385,7 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
         if (late) {
             diag::log_tagged_fmt("api_monitor",
                 "phase_late_complete phase=%s pid=%u backend=%s worker_tid=%lu elapsed_ms=%llu timeout_ms=%u timeout_elapsed_ms=%llu gle=%lu threw=%d",
-                phase,
+                phase_name.c_str(),
                 pid,
                 backend ? backend : "executor",
                 worker_tid,
@@ -373,7 +394,7 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
                 static_cast<unsigned long long>(timeout_elapsed->load(std::memory_order_acquire)),
                 result.gle,
                 result.threw ? 1 : 0);
-            log_phase_state("late_complete", phase, pid, worker_tid, result.elapsed_ms, timeout_ms);
+            log_phase_state("late_complete", phase_name.c_str(), pid, worker_tid, result.elapsed_ms, timeout_ms);
         }
         try {
             promise->set_value(std::move(result));
@@ -418,13 +439,24 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
         sub.priority = 3;
         sub.target_pid = pid;
         sub.lease_token = api_mon_token;
-        sub.body = [worker_body, admission_ptr, phase, pid, api_mon_token]() mutable {
+        sub.cancel_hook = [cancel]() {
+            cancel->requested.store(true, std::memory_order_release);
+        };
+        sub.body = [worker_body, admission_ptr, phase_name, pid, api_mon_token]() mutable {
+            struct admission_release_t {
+                mcp_standalone::downstream::scoped_admission_t* admission;
+                const char* phase;
+                uint32_t pid;
+                uint64_t token;
+                ~admission_release_t() {
+                    diag::log_tagged_fmt("api_monitor",
+                        "BURP-NETWORK-WORKER-RELEASE phase=%s pid=%u token=%llu reason=worker_exit",
+                        phase ? phase : "unknown", pid,
+                        static_cast<unsigned long long>(token));
+                    admission->release("worker_exit");
+                }
+            } release_guard{admission_ptr.get(), phase_name.c_str(), pid, api_mon_token};
             worker_body("executor.diagnostics");
-            diag::log_tagged_fmt("api_monitor",
-                "BURP-NETWORK-WORKER-RELEASE phase=%s pid=%u token=%llu reason=completed",
-                phase ? phase : "unknown", pid,
-                static_cast<unsigned long long>(api_mon_token));
-            admission_ptr->release("completed");
         };
         auto submit_result = aida::infra::executor::submit(std::move(sub));
         posted_executor = submit_result.submitted;
@@ -481,7 +513,7 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
         timed_out.gle = WAIT_TIMEOUT;
         timed_out.elapsed_ms = GetTickCount64() - started_ms;
         timeout_elapsed->store(timed_out.elapsed_ms, std::memory_order_release);
-        phase_timed_out->store(true, std::memory_order_release);
+        cancel->requested.store(true, std::memory_order_release);
         diag::log_tagged_fmt("api_monitor",
             "phase_timeout phase=%s pid=%u backend=executor.diagnostics caller_tid=%lu elapsed_ms=%llu timeout_ms=%u posted=%d current_phase=%s",
             phase,
@@ -1464,28 +1496,11 @@ inline bool local_export_rva_fallback(const std::string& module_name,
     return false;
 }
 
-inline bool with_active_pid(uint32_t pid, const std::function<bool()>& fn) {
-    const uint32_t previous = driver_bridge::attached_pid();
-    bool changed = false;
-    if (pid != 0 && previous != pid) {
-        if (!driver_bridge::set_active_pid(pid))
-            return false;
-        changed = true;
-    }
-    const bool ok = fn();
-    if (changed) {
-        if (previous != 0)
-            driver_bridge::set_active_pid(previous);
-        else
-            driver_bridge::clear_active_pid();
-    }
-    return ok;
-}
-
 inline bool resolve_request(uint32_t pid,
                             const api_request_t& request,
                             const std::vector<driver_bridge::module_info_t>& modules,
-                            api_target_t& out) {
+                            api_target_t& out,
+                            const phase_cancel_t* cancel = nullptr) {
     const uint64_t started_ms = GetTickCount64();
     uint64_t manual_address = 0;
     if (parse_u64(request.original, manual_address) && manual_address != 0) {
@@ -1523,34 +1538,35 @@ inline bool resolve_request(uint32_t pid,
     }
 
     if (!resolved) {
-        with_active_pid(pid, [&]() -> bool {
-            for (const auto& m : modules) {
-                if (!module_name_matches(m, request.module_name))
-                    continue;
-                const uint64_t module_start_ms = GetTickCount64();
-                const uint64_t candidate = driver_bridge::resolve_export(m.base, request.function_name.c_str());
-                const uint64_t elapsed_ms = GetTickCount64() - module_start_ms;
-                if (elapsed_ms >= 250 || candidate != 0) {
-                    const std::string candidate_module = !m.name.empty() ? m.name : basename_of(m.path);
-                    diag::log_tagged_fmt("api_monitor",
-                                         "resolve_request driver_export pid=%u module=%s base=%s function=%s ok=%d address=%s elapsed_ms=%llu",
-                                         pid,
-                                         candidate_module.c_str(),
-                                         hex_addr(m.base).c_str(),
-                                         request.function_name.c_str(),
-                                         candidate != 0 ? 1 : 0,
-                                         candidate != 0 ? hex_addr(candidate).c_str() : "0x0",
-                                         static_cast<unsigned long long>(elapsed_ms));
-                }
-                if (candidate == 0)
-                    continue;
-                address = candidate;
-                module_name = !m.name.empty() ? m.name : basename_of(m.path);
-                resolved = true;
-                return true;
+        for (const auto& m : modules) {
+            if (cancel && cancel->requested.load(std::memory_order_acquire)) {
+                SetLastError(ERROR_CANCELLED);
+                return false;
             }
-            return true;
-        });
+            if (!module_name_matches(m, request.module_name))
+                continue;
+            const uint64_t module_start_ms = GetTickCount64();
+            const uint64_t candidate = driver_bridge::resolve_export_for(pid, m.base, request.function_name.c_str());
+            const uint64_t elapsed_ms = GetTickCount64() - module_start_ms;
+            if (elapsed_ms >= 250 || candidate != 0) {
+                const std::string candidate_module = !m.name.empty() ? m.name : basename_of(m.path);
+                diag::log_tagged_fmt("api_monitor",
+                                     "resolve_request driver_export pid=%u module=%s base=%s function=%s ok=%d address=%s elapsed_ms=%llu",
+                                     pid,
+                                     candidate_module.c_str(),
+                                     hex_addr(m.base).c_str(),
+                                     request.function_name.c_str(),
+                                     candidate != 0 ? 1 : 0,
+                                     candidate != 0 ? hex_addr(candidate).c_str() : "0x0",
+                                     static_cast<unsigned long long>(elapsed_ms));
+            }
+            if (candidate == 0)
+                continue;
+            address = candidate;
+            module_name = !m.name.empty() ? m.name : basename_of(m.path);
+            resolved = true;
+            break;
+        }
     }
 
     if (!resolved) {
@@ -2519,7 +2535,8 @@ inline void kernel_context_loop() {
         initial_armed);
 
     uint64_t poll_count = 0;
-    while (g_state.polling.load()) {
+    while (g_state.polling.load(std::memory_order_acquire) &&
+           !g_state.stop_requested.load(std::memory_order_acquire)) {
         if (!driver_bridge::using_kernel_driver()) {
             g_state.debugger_error.store(ERROR_INVALID_HANDLE);
             g_state.active.store(false);
@@ -2563,24 +2580,45 @@ inline void stop() {
         pid_snapshot());
     const uint64_t stop_start = GetTickCount64();
     const uint32_t pid = pid_snapshot();
+    g_state.stop_requested.store(true, std::memory_order_release);
     g_state.polling.store(false);
-    int waited = 0;
-    for (; waited < 60 && g_state.debug_loop_running.load(); ++waited)
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    std::shared_ptr<worker_lifetime_t> worker;
+    {
+        std::lock_guard<std::mutex> lock(g_state.mutex);
+        worker = g_state.worker_owner;
+    }
+    bool worker_completed = !worker;
+    if (worker) {
+        std::unique_lock<std::mutex> lock(worker->mutex);
+        worker_completed = worker->condition.wait_for(lock, std::chrono::milliseconds(1500),
+            [&worker]() { return worker->completed; });
+    }
     diag::log_tagged_fmt("api_monitor",
         "stop_wait_done pid=%u waited_ms=%llu iterations=%d debug_loop=%d attached=%d",
         pid,
         static_cast<unsigned long long>(GetTickCount64() - stop_start),
-        waited,
+        worker_completed ? 0 : 60,
         g_state.debug_loop_running.load() ? 1 : 0,
         g_state.debug_attached.load() ? 1 : 0);
-    if (g_state.debug_loop_running.load() && g_state.debug_attached.exchange(false)) {
+    if (!worker_completed || g_state.debug_loop_running.load(std::memory_order_acquire)) {
         diag::log_tagged_fmt("api_monitor",
             "stop_kernel_context_loop_still_running pid=%u waited_ms=%llu",
             pid,
             static_cast<unsigned long long>(GetTickCount64() - stop_start));
+        g_state.active.store(false, std::memory_order_release);
+        diag::log_tagged_fmt("api_monitor",
+            "stop_exit active=0 polling=%d debug_loop=%d attached=%d elapsed_ms=%llu deferred=1 worker_owned=%d worker_completed=%d stop_requested=%d",
+            g_state.polling.load() ? 1 : 0,
+            g_state.debug_loop_running.load() ? 1 : 0,
+            g_state.debug_attached.load() ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - stop_start),
+            worker ? 1 : 0,
+            worker_completed ? 1 : 0,
+            g_state.stop_requested.load(std::memory_order_acquire) ? 1 : 0);
+        return;
     }
-    clear_armed_breakpoints("stop");
+    if (!worker)
+        clear_armed_breakpoints("stop");
     {
         std::lock_guard<std::mutex> lock(g_state.mutex);
         for (auto& target : g_state.targets)
@@ -2590,6 +2628,7 @@ inline void stop() {
         g_state.modules.clear();
         g_state.socket_cache = {};
         g_state.pid = 0;
+        g_state.worker_owner.reset();
     }
     g_state.active.store(false);
     diag::log_tagged_fmt("api_monitor",
@@ -2621,8 +2660,32 @@ inline bool start_polling(std::string& error) {
             static_cast<unsigned long long>(GetTickCount64() - start_ms));
         return false;
     }
-    if (g_state.debug_loop_running.exchange(true)) {
-        if (g_state.debug_attached.load()) {
+    auto worker_owner = std::make_shared<worker_lifetime_t>();
+    bool already_running = false;
+    bool already_attached = false;
+    {
+        std::lock_guard<std::mutex> lock(g_state.mutex);
+        if (g_state.worker_owner) {
+            std::lock_guard<std::mutex> worker_lock(g_state.worker_owner->mutex);
+            if (!g_state.worker_owner->completed) {
+                error = "API monitor kernel context loop is still draining.";
+                diag::log_tagged_fmt("api_monitor",
+                    "start_polling_exit ok=0 reason=worker_draining elapsed_ms=%llu",
+                    static_cast<unsigned long long>(GetTickCount64() - start_ms));
+                return false;
+            }
+            g_state.worker_owner.reset();
+        }
+        already_running = g_state.debug_loop_running.exchange(true);
+        already_attached = g_state.debug_attached.load();
+        if (!already_running) {
+            g_state.stop_requested.store(false, std::memory_order_release);
+            g_state.polling.store(true, std::memory_order_release);
+            g_state.worker_owner = worker_owner;
+        }
+    }
+    if (already_running) {
+        if (already_attached) {
             arm_existing_threads();
             diag::log_tagged_fmt("api_monitor",
                 "start_polling_exit ok=1 reason=already_attached elapsed_ms=%llu",
@@ -2636,7 +2699,6 @@ inline bool start_polling(std::string& error) {
         return false;
     }
 
-    g_state.polling.store(true);
     bool posted = false;
     diag::log_tagged_fmt("api_monitor",
         "start_polling_post_begin pid=%u caller_tid=%lu",
@@ -2656,6 +2718,11 @@ inline bool start_polling(std::string& error) {
             poll_admission.result().observed, poll_admission.result().limit);
         g_state.polling.store(false);
         g_state.debug_loop_running.store(false);
+        {
+            std::lock_guard<std::mutex> lock(g_state.mutex);
+            if (g_state.worker_owner == worker_owner)
+                g_state.worker_owner.reset();
+        }
         error = "Downstream api_monitor capacity exhausted.";
         return false;
     }
@@ -2675,12 +2742,52 @@ inline bool start_polling(std::string& error) {
         sub.priority = 4;
         sub.target_pid = pid_snapshot();
         sub.lease_token = poll_token;
-        sub.body = [poll_admission_ptr, poll_token]() {
-            kernel_context_loop();
+        sub.body = [poll_admission_ptr, poll_token, worker_owner]() {
+            try {
+                kernel_context_loop();
+            } catch (const std::exception& ex) {
+                g_state.debugger_error.store(ERROR_UNHANDLED_EXCEPTION);
+                g_state.polling.store(false);
+                g_state.active.store(false);
+                clear_armed_breakpoints("kernel_context_loop_exception");
+                g_state.debug_attached.store(false);
+                g_state.debug_loop_running.store(false);
+                diag::log_tagged_fmt("api_monitor",
+                    "kernel_context_loop_exception token=%llu message=%s",
+                    static_cast<unsigned long long>(poll_token), ex.what());
+            } catch (...) {
+                g_state.debugger_error.store(ERROR_UNHANDLED_EXCEPTION);
+                g_state.polling.store(false);
+                g_state.active.store(false);
+                clear_armed_breakpoints("kernel_context_loop_exception");
+                g_state.debug_attached.store(false);
+                g_state.debug_loop_running.store(false);
+                diag::log_tagged_fmt("api_monitor",
+                    "kernel_context_loop_exception token=%llu message=unknown",
+                    static_cast<unsigned long long>(poll_token));
+            }
+            if (g_state.stop_requested.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> lock(g_state.mutex);
+                for (auto& target : g_state.targets)
+                    target.active = false;
+                g_state.targets.clear();
+                g_state.requested.clear();
+                g_state.modules.clear();
+                g_state.socket_cache = {};
+                g_state.pid = 0;
+                diag::log_tagged_fmt("api_monitor",
+                    "kernel_context_loop_cancelled_state_released token=%llu",
+                    static_cast<unsigned long long>(poll_token));
+            }
             diag::log_tagged_fmt("api_monitor",
                 "BURP-NETWORK-WORKER-RELEASE phase=kernel_context_loop token=%llu reason=completed",
                 static_cast<unsigned long long>(poll_token));
             poll_admission_ptr->release("completed");
+            {
+                std::lock_guard<std::mutex> lock(worker_owner->mutex);
+                worker_owner->completed = true;
+            }
+            worker_owner->condition.notify_all();
         };
         auto submit_result = aida::infra::executor::submit(std::move(sub));
         posted = submit_result.submitted;
@@ -2697,6 +2804,11 @@ inline bool start_polling(std::string& error) {
         post_reject_reason.empty() ? "<none>" : post_reject_reason.c_str());
     if (!posted) {
         poll_admission_ptr->release("executor_rejected");
+        {
+            std::lock_guard<std::mutex> lock(g_state.mutex);
+            if (g_state.worker_owner == worker_owner)
+                g_state.worker_owner.reset();
+        }
         g_state.polling.store(false);
         g_state.debug_loop_running.store(false);
         error = "Failed to schedule API monitor worker on executor.";
@@ -2781,6 +2893,25 @@ inline bool start(uint32_t requested_pid,
     diag::log_tagged_fmt("api_monitor",
         "start_after_stop elapsed_ms=%llu",
         static_cast<unsigned long long>(GetTickCount64() - start_ms));
+    bool previous_worker_draining = false;
+    {
+        std::lock_guard<std::mutex> lock(g_state.mutex);
+        if (g_state.worker_owner) {
+            std::lock_guard<std::mutex> worker_lock(g_state.worker_owner->mutex);
+            previous_worker_draining = !g_state.worker_owner->completed;
+            if (!previous_worker_draining)
+                g_state.worker_owner.reset();
+        }
+    }
+    if (previous_worker_draining) {
+        error = "Previous API monitor worker is still draining after cancellation.";
+        summary["failed_phase"] = "stop_drain";
+        summary["status"] = status_json();
+        diag::log_tagged_fmt("api_monitor",
+            "start_exit ok=0 reason=previous_worker_draining elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - start_ms));
+        return false;
+    }
 
     uint32_t pid = requested_pid;
     if (pid == 0)
@@ -2923,10 +3054,28 @@ inline bool start(uint32_t requested_pid,
         log_phase_state("start_exit_target_is_x64_false", "start", pid, GetCurrentThreadId(), GetTickCount64() - start_ms, 0);
         return false;
     }
-    auto attach_phase = run_phase_with_timeout<driver_attach_phase_result_t>("driver_attach", pid, 7000, [pid]() {
+    auto attach_phase = run_phase_with_timeout<driver_attach_phase_result_t>("driver_attach", pid, 7000, [pid](phase_cancel_t& cancel) {
         driver_attach_phase_result_t result;
         result.kernel = driver_bridge::using_kernel_driver();
         result.attached_pid_before = driver_bridge::attached_pid();
+        struct active_pid_restore_t {
+            phase_cancel_t& cancel;
+            uint32_t target_pid;
+            uint32_t previous_pid;
+            ~active_pid_restore_t() {
+                if (!cancel.requested.load(std::memory_order_acquire) || previous_pid == target_pid || driver_bridge::attached_pid() != target_pid)
+                    return;
+                const bool restored = previous_pid != 0
+                    ? driver_bridge::set_active_pid(previous_pid)
+                    : driver_bridge::clear_active_pid();
+                diag::log_tagged_fmt("api_monitor",
+                    "driver_attach_cancel_restore target_pid=%u previous_pid=%u restored=%d active_pid_after=%u",
+                    target_pid,
+                    previous_pid,
+                    restored ? 1 : 0,
+                    driver_bridge::attached_pid());
+            }
+        } restore{cancel, pid, result.attached_pid_before};
         const auto attached = driver_bridge::attached_pids();
         result.attached_count = attached.size();
         std::string phase_error;
@@ -3000,13 +3149,17 @@ inline bool start(uint32_t requested_pid,
 
     const auto apis_copy = apis;
     const auto modules_copy = modules;
-    auto resolve_phase = run_phase_with_timeout<resolve_phase_result_t>("api_resolve", pid, 9000, [pid, apis_copy, modules_copy]() {
+    auto resolve_phase = run_phase_with_timeout<resolve_phase_result_t>("api_resolve", pid, 9000, [pid, apis_copy, modules_copy](phase_cancel_t& cancel) {
         resolve_phase_result_t result;
         result.module_count = modules_copy.size();
         uint32_t slot = 0;
         for (const auto& request : apis_copy) {
+            if (cancel.requested.load(std::memory_order_acquire)) {
+                SetLastError(ERROR_CANCELLED);
+                break;
+            }
             api_target_t target;
-            if (resolve_request(pid, request, modules_copy, target)) {
+            if (resolve_request(pid, request, modules_copy, target, &cancel)) {
                 target.bp_index = slot++;
                 result.targets.push_back(target);
                 nlohmann::json item;
@@ -3258,8 +3411,10 @@ inline nlohmann::json status_json() {
     nlohmann::json j;
     uint32_t armed = 0;
     std::vector<std::pair<api_target_t, uint32_t>> readback_requests;
+    std::shared_ptr<worker_lifetime_t> worker;
     {
         std::lock_guard<std::mutex> lock(g_state.mutex);
+        worker = g_state.worker_owner;
         j["pid"] = g_state.pid;
         j["target_count"] = static_cast<int>(g_state.targets.size());
         j["event_count"] = static_cast<int>(g_state.events.size());
@@ -3337,8 +3492,17 @@ inline nlohmann::json status_json() {
     };
     j["active"] = g_state.active.load();
     j["polling"] = g_state.polling.load();
+    j["stop_requested"] = g_state.stop_requested.load(std::memory_order_acquire);
     j["debug_attached"] = g_state.debug_attached.load();
     j["debug_loop_running"] = g_state.debug_loop_running.load();
+    bool worker_completed = true;
+    if (worker) {
+        std::lock_guard<std::mutex> lock(worker->mutex);
+        worker_completed = worker->completed;
+    }
+    j["worker_owned"] = static_cast<bool>(worker);
+    j["worker_completed"] = worker_completed;
+    j["worker_draining"] = worker && !worker_completed;
     j["cleanup_running"] = g_state.cleanup_running.load();
     j["debugger_error"] = static_cast<unsigned long>(g_state.debugger_error.load());
     j["total_hits"] = g_state.total_hits.load(std::memory_order_relaxed);

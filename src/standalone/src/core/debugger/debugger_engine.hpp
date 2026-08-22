@@ -324,6 +324,8 @@ struct state_t {
 
 
 	std::mutex                       cache_mtx;
+	std::mutex                       error_mtx;
+	std::string                      error_text;
 	register_set_t                   cached_regs{};
 	std::vector<cached_thread_t>     cached_threads;
 	std::atomic<uint64_t>            cached_threads_generation{1};

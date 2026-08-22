@@ -627,6 +627,8 @@ bool parse_url(const std::string& url,
                std::string& path)
 {
     diag::log_tagged_fmt("audit_http", "parse_url url=%s", url.c_str());
+    if (std::any_of(url.begin(), url.end(), [](unsigned char c) { return c < 0x20 || c == 0x7f; }))
+        return false;
     auto sep = url.find("://");
     if (sep == std::string::npos) {
         scheme = "http";
@@ -648,7 +650,14 @@ bool parse_url(const std::string& url,
         port = (scheme == "https") ? 443 : 80;
     } else {
         host = authority.substr(0, colon);
-        try { port = static_cast<uint16_t>(std::stoul(authority.substr(colon + 1))); }
+        try {
+            const std::string port_text = authority.substr(colon + 1);
+            size_t consumed = 0;
+            const unsigned long parsed = std::stoul(port_text, &consumed, 10);
+            if (consumed != port_text.size() || parsed == 0 || parsed > 65535)
+                return false;
+            port = static_cast<uint16_t>(parsed);
+        }
         catch (...) {
             diag::log_tagged_fmt("audit_http", "parse_url invalid_port authority=%s", authority.c_str());
             return false;

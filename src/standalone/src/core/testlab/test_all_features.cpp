@@ -149,16 +149,19 @@ namespace test_all_features {
 
 		std::atomic<bool> g_running{ false };
 		std::atomic<bool> g_start_queued{ false };
+		std::atomic<bool> g_shutdown_cancel_requested{ false };
 		std::atomic<bool> g_cancel_requested{ false };
 		std::atomic<bool> g_interactive_cancel_cleanup_inflight{ false };
 		std::atomic<bool> g_target_unavailable{ false };
 		std::atomic<bool> g_full_test_guard_active{ false };
+		std::atomic<std::uint32_t> g_full_test_guard_depth{ 0 };
 
 		std::atomic<int>  g_total{ 0 };
 		std::atomic<int>  g_current{ 0 };
 		std::atomic<int>  g_passed{ 0 };
 		std::atomic<int>  g_failed{ 0 };
 		std::atomic<int>  g_skipped{ 0 };
+		std::atomic<int>  g_prerequisite_skipped{ 0 };
 
 		std::atomic<int>  g_suspect{ 0 };
 
@@ -958,6 +961,7 @@ namespace test_all_features {
 		}
 
 		void begin_test_guard_impl(const char* source, HANDLE hf = INVALID_HANDLE_VALUE) {
+			const std::uint32_t previous_depth = g_full_test_guard_depth.fetch_add(1u, std::memory_order_acq_rel);
 			g_full_test_guard_active.store(true, std::memory_order_release);
 			log_msg(hf, "env", "full_test_guard_enter source=%s pid=%lu tid=%lu tick64=%llu user_default_skip_load=%d",
 				source ? source : "unspecified",
@@ -965,7 +969,8 @@ namespace test_all_features {
 				static_cast<unsigned long>(GetCurrentThreadId()),
 				static_cast<unsigned long long>(GetTickCount64()),
 				pdb_default_skip::get() ? 1 : 0);
-			set_full_test_env(hf, true, source ? source : "full_test_guard_enter");
+			if (previous_depth == 0)
+				set_full_test_env(hf, true, source ? source : "full_test_guard_enter");
 		}
 
 		void end_test_guard_impl(const char* source, HANDLE hf = INVALID_HANDLE_VALUE) {
@@ -975,8 +980,13 @@ namespace test_all_features {
 				static_cast<unsigned long>(GetCurrentThreadId()),
 				static_cast<unsigned long long>(GetTickCount64()),
 				pdb_default_skip::get() ? 1 : 0);
-			set_full_test_env(hf, false, source ? source : "full_test_guard_exit");
-			g_full_test_guard_active.store(false, std::memory_order_release);
+			std::uint32_t depth = g_full_test_guard_depth.load(std::memory_order_acquire);
+			while (depth != 0 && !g_full_test_guard_depth.compare_exchange_weak(depth, depth - 1u,
+				std::memory_order_acq_rel, std::memory_order_acquire)) {}
+			if (depth == 1u) {
+				set_full_test_env(hf, false, source ? source : "full_test_guard_exit");
+				g_full_test_guard_active.store(false, std::memory_order_release);
+			}
 		}
 
 		void set_step(const char* label) {
@@ -1237,7 +1247,10 @@ namespace test_all_features {
 				refresh_phase_entry_from_counters(entry);
 				entry.done = true;
 				entry.end_ms = now;
-				entry.status = entry.hung_logged ? "DONE_AFTER_HUNG" : "DONE";
+				if (entry.hung_logged)
+					entry.status = "DONE_AFTER_HUNG";
+				else if (entry.status != "PREREQUISITE_FAILED")
+					entry.status = "DONE";
 				phase_index = index + 1;
 				phase_planned = entry.planned;
 				phase_completed = entry.completed;
@@ -1262,7 +1275,7 @@ namespace test_all_features {
 				g_failed.load(),
 				g_skipped.load(),
 				running_done());
-			if (skip_delta != 0 && phase != nullptr && std::strcmp(phase, "testlab features") != 0) {
+			if (skip_delta != 0 && phase != nullptr && std::strcmp(phase, "testlab features") != 0 && status != "PREREQUISITE_FAILED") {
 				log_msg(hf, "phase",
 					"FAIL -- phase '%s' produced %d non-destructive SKIP(s); only 'testlab features' may emit SKIPs - converting to FAIL immediately pid=%lu tid=%lu now_ms=%llu passed=%d failed=%d skipped_before_convert=%d",
 					phase,
@@ -1511,9 +1524,17 @@ namespace test_all_features {
 			set_phase(label);
 			set_stepf("skip phase: %s", label);
 			log_phase_begin(hf, label);
-			if (tests > 0)
-				g_failed.fetch_add(tests);
-			log_msg(hf, "phase", "FAIL -- %s requires a live attached target; target unavailable; failed=%d",
+			{
+				std::lock_guard<std::mutex> lk(g_phase_ledger_mtx);
+				const int index = phase_ledger_index_locked(label);
+				if (index >= 0)
+					g_phase_ledger[static_cast<std::size_t>(index)].status = "PREREQUISITE_FAILED";
+			}
+			if (tests > 0) {
+				g_skipped.fetch_add(tests);
+				g_prerequisite_skipped.fetch_add(tests);
+			}
+			log_msg(hf, "phase", "SKIP -- %s requires a live attached target; prerequisite failed; skipped=%d",
 				label,
 				tests);
 			log_phase_end(hf, label);
@@ -1604,6 +1625,8 @@ namespace test_all_features {
 					record.c_str());
 			}
 			const int raw_skips = g_skipped.load(std::memory_order_acquire);
+			const int prerequisite_skips = g_prerequisite_skipped.load(std::memory_order_acquire);
+			const int destructive_skips = (std::max)(0, raw_skips - prerequisite_skips);
 			log_msg(hf, safe_tag, "DESTRUCTIVE-SKIP-ACCOUNTING -- scope=%s expected=%d observed_expected=%d missing=%d unexpected=%d duplicate=%d global_skipped=%d final=%d",
 				safe_scope,
 				kExpectedDestructiveSkipCount,
@@ -1611,7 +1634,7 @@ namespace test_all_features {
 				missing,
 				g_unexpected_destructive_skip_count,
 				g_duplicate_destructive_skip_count,
-				raw_skips,
+				destructive_skips,
 				final_accounting ? 1 : 0);
 			return missing + g_unexpected_destructive_skip_count + g_duplicate_destructive_skip_count;
 		}
@@ -1975,7 +1998,7 @@ namespace test_all_features {
 		void log_target_launch_context(HANDLE hf, const std::wstring& exe, const std::wstring& work_dir) {
 			const std::wstring exe_full = full_path_for_log(exe);
 			const std::wstring work_dir_full = full_path_for_log(work_dir);
-			const std::wstring command_line = L"\"" + exe_full + L"\"" + kTargetArgsWide;
+			const std::wstring command_line = L"\"" + exe_full + L"\" " + kTargetArgsWide;
 			const std::string exe_req = wide_to_log_string(exe);
 			const std::string exe_eff = wide_to_log_string(exe_full);
 			const std::string work_req = work_dir.empty() ? std::string("<inherit>") : wide_to_log_string(work_dir);
@@ -2577,6 +2600,7 @@ namespace test_all_features {
 				log_phase_end(hf, "launch target");
 				return false;
 			}
+			const std::wstring requested_exe = exe;
 			std::wstring normalized_exe = normalize_found_target(exe);
 			if (!normalized_exe.empty())
 				exe = normalized_exe;
@@ -2599,7 +2623,8 @@ namespace test_all_features {
 		auto t0 = std::chrono::steady_clock::now();
 
 
-			std::wstring work_dir = parent_directory_for_path(exe);
+			const std::wstring requested_work_dir = parent_directory_for_path(exe);
+			std::wstring work_dir = requested_work_dir;
 			if (work_dir.empty())
 				work_dir = current_directory_for_launch();
 			std::string work_dir_log = wide_to_log_string(work_dir);
@@ -2611,7 +2636,7 @@ namespace test_all_features {
 			}
 			set_step("launch: log_target_launch_context");
 			log_msg(hf, "launch", "BEFORE target launch context probe");
-			DWORD context_seh = log_target_launch_context_seh(hf, exe, work_dir);
+			DWORD context_seh = log_target_launch_context_seh(hf, requested_exe, requested_work_dir);
 			if (context_seh != 0) {
 				log_msg(hf, "launch", "target launch context probe SEH=0x%08lX; continuing to spawn",
 					static_cast<unsigned long>(context_seh));
@@ -2633,17 +2658,36 @@ namespace test_all_features {
 			log_msg(hf, "launch", "CALL spawn_and_attach_target exe=%s work_dir=%s",
 				exe_log.empty() ? "<unavailable>" : exe_log.c_str(),
 				work_dir.empty() ? "<inherit>" : work_dir_log.c_str());
-			bool ok = debugger_engine::spawn_and_attach_target(exe, kTargetArgsWide, work_dir, &pid);
-			DWORD spawn_gle = GetLastError();
+			run_target::launch_result_t launch_result{};
+			log_msg(hf, "launch", "spawn_and_attach_target request exe=%s cwd=%s command=\"%s\" host_pid=%lu host_tid=%lu",
+				exe_log.empty() ? "<unavailable>" : exe_log.c_str(),
+				work_dir.empty() ? "<inherit>" : work_dir_log.c_str(),
+				(std::string("\"") + exe_log + "\" " + kTargetArgsText).c_str(),
+				static_cast<unsigned long>(GetCurrentProcessId()),
+				static_cast<unsigned long>(GetCurrentThreadId()));
+			run_target::launch_options_t launch_options;
+			launch_options.exe_path = exe;
+			launch_options.args = kTargetArgsWide;
+			launch_options.working_dir = work_dir;
+			launch_options.isolation = run_target::isolation_t::same_desktop_jobbed;
+			launch_options.block_network = false;
+			launch_options.kill_on_host_exit = true;
+			launch_options.attach_after_resume = true;
+			bool ok = debugger_engine::spawn_and_attach_target(launch_options, &pid, &launch_result);
+			DWORD spawn_gle = launch_result.win32_error != 0 ? launch_result.win32_error : GetLastError();
 			SetEnvironmentVariableA("AIDA_TARGET_LOG_PATH", nullptr);
 
 			auto t1 = std::chrono::steady_clock::now();
 			auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-			log_msg(hf, "launch", "spawn_and_attach_target returned ok=%d pid=%u elapsed=%lld ms gle=%lu driver_status=\"%s\" driver_last_error=\"%s\"",
+			log_msg(hf, "launch", "spawn_and_attach_target returned ok=%d pid=%u tid=%u elapsed=%lld ms win32_error=%lu result_error=\"%s\" attach_pid=%u driver_attached=%d driver_status=\"%s\" driver_last_error=\"%s\"",
 				ok ? 1 : 0,
 				pid,
+				launch_result.thread_id,
 				(long long)ms,
 				static_cast<unsigned long>(spawn_gle),
+				launch_result.error.c_str(),
+				driver_bridge::attached_pid(),
+				(g_driver_attached.load(std::memory_order_acquire) && driver_bridge::attached_pid() == pid) ? 1 : 0,
 				driver_bridge::status().c_str(),
 				driver_bridge::last_error().c_str());
 			log_debug_snapshot(hf, "launch", "AFTER spawn_and_attach_target");
@@ -2713,9 +2757,17 @@ namespace test_all_features {
 				&& attached_pid == target_pid;
 			if (!target_verified) {
 				mark_target_unavailable(hf, "testlab", "testlab skipped because there is no verified attached target", target_pid, attached_pid, 0);
-				if (total > 0)
-					g_failed.fetch_add(total);
-				log_msg(hf, "testlab", "FAIL -- %d registered Test Lab features require a verified target; target_pid=%u driver_attached=%d driver_pid=%u",
+				if (total > 0) {
+					g_skipped.fetch_add(total);
+					g_prerequisite_skipped.fetch_add(total);
+				}
+				{
+					std::lock_guard<std::mutex> lk(g_phase_ledger_mtx);
+					const int index = phase_ledger_index_locked("testlab features");
+					if (index >= 0)
+						g_phase_ledger[static_cast<std::size_t>(index)].status = "PREREQUISITE_FAILED";
+				}
+				log_msg(hf, "testlab", "SKIP -- %d registered Test Lab features require a verified target; prerequisite failed; target_pid=%u driver_attached=%d driver_pid=%u",
 					total,
 					target_pid,
 					g_driver_attached.load(std::memory_order_acquire) ? 1 : 0,
@@ -3880,16 +3932,9 @@ namespace test_all_features {
 		struct full_test_env_guard_t {
 			HANDLE* hf = nullptr;
 			bool active = false;
-			bool owns_entry = false;
 
 			explicit full_test_env_guard_t(HANDLE* handle) : hf(handle), active(true) {
-				owns_entry = !g_full_test_guard_active.load(std::memory_order_acquire);
-				if (owns_entry)
-					begin_test_guard_impl("run_all begin", hf ? *hf : INVALID_HANDLE_VALUE);
-				else
-					log_msg(hf ? *hf : INVALID_HANDLE_VALUE, "env", "full_test_guard_reuse source=run_all begin pid=%lu tid=%lu",
-						static_cast<unsigned long>(GetCurrentProcessId()),
-						static_cast<unsigned long>(GetCurrentThreadId()));
+				begin_test_guard_impl("run_all begin", hf ? *hf : INVALID_HANDLE_VALUE);
 			}
 
 			void clear(const char* reason) {
@@ -4105,35 +4150,47 @@ namespace test_all_features {
 			}
 
 			if (!cancelled()) {
-				set_phase("Analysis feature tests");
-				set_step("phase call: analysis feature tests");
-				log_phase_begin(hf, "analysis feature tests");
-				phase_analysis_tests(hf, g_passed, g_failed, g_skipped, cancelled);
-				log_phase_end(hf, "analysis feature tests");
-				if (!target_unavailable())
-					verify_target_liveness(hf, "after analysis feature tests");
+				if (target_unavailable()) {
+					skip_phase_target_unavailable(hf, "analysis feature tests", kAnalysisFeatureTests);
+				} else {
+					set_phase("Analysis feature tests");
+					set_step("phase call: analysis feature tests");
+					log_phase_begin(hf, "analysis feature tests");
+					phase_analysis_tests(hf, g_passed, g_failed, g_skipped, cancelled);
+					log_phase_end(hf, "analysis feature tests");
+					if (!target_unavailable())
+						verify_target_liveness(hf, "after analysis feature tests");
+				}
 			}
 
 			if (!cancelled()) {
-				set_phase("Network feature tests");
-				set_step("phase call: network feature tests");
-				log_phase_begin(hf, "network feature tests");
-				phase_network_tests(hf, g_passed, g_failed, g_skipped, cancelled);
-				log_phase_end(hf, "network feature tests");
-				if (!target_unavailable())
-					verify_target_liveness(hf, "after network feature tests");
+				if (target_unavailable()) {
+					skip_phase_target_unavailable(hf, "network feature tests", kNetworkFeatureTests);
+				} else {
+					set_phase("Network feature tests");
+					set_step("phase call: network feature tests");
+					log_phase_begin(hf, "network feature tests");
+					phase_network_tests(hf, g_passed, g_failed, g_skipped, cancelled);
+					log_phase_end(hf, "network feature tests");
+					if (!target_unavailable())
+						verify_target_liveness(hf, "after network feature tests");
+				}
 			}
 
 			cleanup_network_runtime(hf, "after network feature tests");
 
 			if (!cancelled()) {
-				set_phase("Burp suite feature tests");
-				set_step("phase call: burp suite feature tests");
-				log_phase_begin(hf, "burp suite feature tests");
-				phase_burp_tests(hf, g_passed, g_failed, g_skipped, cancelled);
-				log_phase_end(hf, "burp suite feature tests");
-				if (!target_unavailable())
-					verify_target_liveness(hf, "after burp suite feature tests");
+				if (target_unavailable()) {
+					skip_phase_target_unavailable(hf, "burp suite feature tests", kBurpFeatureTests);
+				} else {
+					set_phase("Burp suite feature tests");
+					set_step("phase call: burp suite feature tests");
+					log_phase_begin(hf, "burp suite feature tests");
+					phase_burp_tests(hf, g_passed, g_failed, g_skipped, cancelled);
+					log_phase_end(hf, "burp suite feature tests");
+					if (!target_unavailable())
+						verify_target_liveness(hf, "after burp suite feature tests");
+				}
 			}
 
 			if (!cancelled()) {
@@ -4154,11 +4211,22 @@ namespace test_all_features {
 			}
 
 			if (!cancelled()) {
-				set_phase("MCP tool tests");
-				set_step("phase call: MCP tool tests");
-				log_phase_begin(hf, "MCP tool tests");
-				phase_mcp_tests(hf, g_passed, g_failed, g_skipped, cancelled);
-				log_phase_end(hf, "MCP tool tests");
+				if (target_unavailable()) {
+					skip_phase_target_unavailable(hf, "MCP tool tests", kMcpFeatureTests);
+				} else {
+					set_phase("MCP tool tests");
+					set_step("phase call: MCP tool tests");
+					log_phase_begin(hf, "MCP tool tests");
+					mcp_phase_context_t mcp_context;
+					mcp_run_fixture_context_t mcp_fixture_context;
+					mcp_context.passed = &g_passed;
+					mcp_context.failed = &g_failed;
+					mcp_context.skipped = &g_skipped;
+					mcp_context.cancelled = cancelled;
+					mcp_context.fixture = &mcp_fixture_context;
+					phase_mcp_tests(hf, mcp_context);
+					log_phase_end(hf, "MCP tool tests");
+				}
 			}
 
 			try {
@@ -4169,20 +4237,24 @@ namespace test_all_features {
 			phase_stop_target(hf, target_pid);
 
 			set_phase("Complete");
-			const int skip_accounting_errors = log_destructive_skip_accounting(hf, "summary", "final", true);
+			const int raw_skip_accounting_errors = log_destructive_skip_accounting(hf, "summary", "final", true);
+			const int skip_accounting_errors = target_unavailable() ? 0 : raw_skip_accounting_errors;
 			const int raw_skips = g_skipped.load(std::memory_order_acquire);
-			if (raw_skips > kExpectedDestructiveSkipCount) {
-				const int converted = raw_skips - kExpectedDestructiveSkipCount;
+			const int prerequisite_skips = g_prerequisite_skipped.load(std::memory_order_acquire);
+			const int destructive_skips = (std::max)(0, raw_skips - prerequisite_skips);
+			if (destructive_skips > kExpectedDestructiveSkipCount) {
+				const int converted = destructive_skips - kExpectedDestructiveSkipCount;
 				g_skipped.fetch_sub(converted, std::memory_order_acq_rel);
 				g_failed.fetch_add(converted, std::memory_order_acq_rel);
 				log_msg(hf, "summary", "FAIL -- converted %d non-destructive skip(s) into failures; only the six expected destructive keys may remain skipped", converted);
 			}
-			if (skip_accounting_errors != 0 || raw_skips != kExpectedDestructiveSkipCount) {
+			const int expected_destructive_skips = target_unavailable() ? 0 : kExpectedDestructiveSkipCount;
+			if (skip_accounting_errors != 0 || destructive_skips != expected_destructive_skips) {
 				g_failed.fetch_add(1, std::memory_order_acq_rel);
 				log_msg(hf, "summary", "FAIL -- destructive skip accounting expected exact key set observed_expected=%d expected=%d raw_skipped=%d errors=%d",
 					g_expected_destructive_skip_seen_count,
-					kExpectedDestructiveSkipCount,
-					raw_skips,
+					expected_destructive_skips,
+					destructive_skips,
 					skip_accounting_errors);
 			}
 			const int phase_ledger_errors = finalize_phase_ledger(hf);
@@ -4348,6 +4420,10 @@ namespace test_all_features {
 			graph.domain = aida::infra::taskflow_runtime::executor_domain_t::critical;
 			graph.priority = 1;
 			graph.generation = session_run_id;
+			graph.cancel_hook = []() {
+				g_cancel_requested.store(true, std::memory_order_release);
+				diag::log_tagged("test_all", "full-test cancellation requested; current synchronous feature will drain before runner stops");
+			};
 			graph.nodes.reserve(3);
 
 			aida::infra::taskflow_runtime::graph_node_descriptor_t dispatch_setup;
@@ -4451,6 +4527,10 @@ namespace test_all_features {
 		}
 
 		bool start_tests_impl() {
+			if (g_shutdown_cancel_requested.load(std::memory_order_acquire)) {
+				diag::log_tagged("test_all", "start_tests rejected: shutdown requested");
+				return false;
+			}
 			bool expected = false;
 			if (!g_running.compare_exchange_strong(expected, true)) {
 				char snap[1200] = {};
@@ -4465,13 +4545,14 @@ namespace test_all_features {
 				return false;
 			}
 
-			g_cancel_requested.store(false);
+			g_cancel_requested.store(false, std::memory_order_release);
 			g_target_unavailable.store(false);
 			g_total.store(0);
 			g_current.store(0);
 			g_passed.store(0);
 			g_failed.store(0);
 			g_skipped.store(0);
+			g_prerequisite_skipped.store(0);
 			g_suspect.store(0);
 			g_target_pid.store(0);
 			g_target_addr.store(0);
@@ -4586,6 +4667,11 @@ namespace test_all_features {
 
 		bool queue_start_tests_impl(const char* source) {
 			const char* tag = source && source[0] ? source : "start_tests";
+			if (g_shutdown_cancel_requested.load(std::memory_order_acquire)) {
+				set_phase("Cancelling...");
+				set_step("start rejected during shutdown");
+				return false;
+			}
 			if (g_running.load(std::memory_order_acquire)) {
 				char snap[1200] = {};
 				format_debug_snapshot_impl(snap, sizeof(snap));
@@ -4609,6 +4695,12 @@ namespace test_all_features {
 					flush_full_test_log(hf);
 					CloseHandle(hf);
 				}
+				return false;
+			}
+			if (g_shutdown_cancel_requested.load(std::memory_order_acquire)) {
+				g_start_queued.store(false, std::memory_order_release);
+				set_phase("Cancelling...");
+				set_step("start rejected during shutdown");
 				return false;
 			}
 
@@ -4684,20 +4776,77 @@ namespace test_all_features {
 
 		void run_interactive_cancel_cleanup_worker() {
 			struct inflight_reset_t {
-				~inflight_reset_t() {
+				~inflight_reset_t() noexcept {
 					g_interactive_cancel_cleanup_inflight.store(false, std::memory_order_release);
 				}
 			} inflight_reset;
+			HANDLE hf = open_log_file();
+			const ULONGLONG entered_at = GetTickCount64();
+			const std::uint64_t run_id = g_run_id.load(std::memory_order_acquire);
 
 			try {
-				const ULONGLONG t0 = GetTickCount64();
-				aida::burp::camoufox::force_cleanup("testlab.cancel.interactive.async");
-				diag::log_tagged_fmt("test_all", "interactive cancel cleanup completed elapsed_ms=%llu",
-					static_cast<unsigned long long>(GetTickCount64() - t0));
+				const ULONGLONG deadline = entered_at + 15000;
+				auto before = aida::burp::camoufox::get_status();
+				log_msg(hf, "cancel", "cleanup worker entry run_id=%llu tid=%lu inflight=1 deadline_ms=%llu state=%s child_pid=%u child_alive=%d browser_open=%d cleanup_pending=%d child_processes=%u browser_processes=%u",
+					static_cast<unsigned long long>(run_id),
+					static_cast<unsigned long>(GetCurrentThreadId()),
+					static_cast<unsigned long long>(deadline),
+					camoufox_bridge_state_name(before.state),
+					before.child_pid,
+					before.child_alive ? 1 : 0,
+					before.browser_open ? 1 : 0,
+					before.cleanup_pending ? 1 : 0,
+					before.child_process_count,
+					before.browser_process_count);
+				const bool cleanup_result = aida::burp::camoufox::force_cleanup("testlab.cancel.interactive.async");
+				const ULONGLONG after_cleanup = GetTickCount64();
+				const DWORD wait_ms = after_cleanup < deadline ? static_cast<DWORD>(deadline - after_cleanup) : 0u;
+				const bool idle = aida::burp::camoufox::wait_until_idle(wait_ms, "testlab.cancel.interactive.async");
+				auto after = aida::burp::camoufox::get_status();
+				const ULONGLONG finished_at = GetTickCount64();
+				const bool residual_processes = after.child_alive || after.browser_process_count != 0 || after.child_process_count != 0;
+				const bool residual_worker = after.cleanup_pending;
+				log_msg(hf, "cancel", "cleanup receipt run_id=%llu result=%d idle=%d deadline_reached=%d elapsed_ms=%llu wait_ms=%u state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d child_processes=%u browser_processes=%u residual_processes=%d residual_worker=%d last_error_len=%zu",
+					static_cast<unsigned long long>(run_id),
+					cleanup_result ? 1 : 0,
+					idle ? 1 : 0,
+					finished_at >= deadline ? 1 : 0,
+					static_cast<unsigned long long>(finished_at >= entered_at ? finished_at - entered_at : 0),
+					wait_ms,
+					camoufox_bridge_state_name(after.state),
+					after.child_pid,
+					after.child_alive ? 1 : 0,
+					after.browser_open ? 1 : 0,
+					after.page_verified ? 1 : 0,
+					after.privacy_verified ? 1 : 0,
+					after.cleanup_pending ? 1 : 0,
+					after.child_process_count,
+					after.browser_process_count,
+					residual_processes ? 1 : 0,
+					residual_worker ? 1 : 0,
+					after.last_error.size());
 			} catch (const std::exception& ex) {
-				diag::log_tagged_fmt("test_all", "interactive cancel cleanup exception: %s", ex.what());
+				log_msg(hf, "cancel", "cleanup receipt run_id=%llu result=exception elapsed_ms=%llu message_len=%zu residual_processes=unknown residual_worker=unknown",
+					static_cast<unsigned long long>(run_id),
+					static_cast<unsigned long long>(GetTickCount64() - entered_at),
+					std::strlen(ex.what()));
 			} catch (...) {
-				diag::log_tagged("test_all", "interactive cancel cleanup exception: unknown");
+				log_msg(hf, "cancel", "cleanup receipt run_id=%llu result=unknown_exception elapsed_ms=%llu residual_processes=unknown residual_worker=unknown",
+					static_cast<unsigned long long>(run_id),
+					static_cast<unsigned long long>(GetTickCount64() - entered_at));
+			}
+			const ULONGLONG exited_at = GetTickCount64();
+			log_msg(hf, "cancel", "cleanup worker exit run_id=%llu tid=%lu elapsed_ms=%llu running=%d cancel=%d target_pid=%u",
+				static_cast<unsigned long long>(run_id),
+				static_cast<unsigned long>(GetCurrentThreadId()),
+				static_cast<unsigned long long>(exited_at >= entered_at ? exited_at - entered_at : 0),
+				g_running.load(std::memory_order_acquire) ? 1 : 0,
+				g_cancel_requested.load(std::memory_order_acquire) ? 1 : 0,
+				g_target_pid.load(std::memory_order_acquire));
+			log_debug_snapshot(hf, "cancel", "cleanup worker exit snapshot");
+			if (hf != INVALID_HANDLE_VALUE) {
+				flush_full_test_log(hf);
+				CloseHandle(hf);
 			}
 		}
 
@@ -4709,8 +4858,18 @@ namespace test_all_features {
 
 		interactive_cancel_cleanup_post_t post_interactive_cancel_cleanup() {
 			bool expected = false;
-			if (!g_interactive_cancel_cleanup_inflight.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+			if (!g_interactive_cancel_cleanup_inflight.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+				HANDLE hf = open_log_file();
+				log_msg(hf, "cancel", "cleanup post suppressed reason=already_inflight run_id=%llu inflight=1 running=%d cancel=%d",
+					static_cast<unsigned long long>(g_run_id.load(std::memory_order_acquire)),
+					g_running.load(std::memory_order_acquire) ? 1 : 0,
+					g_cancel_requested.load(std::memory_order_acquire) ? 1 : 0);
+				if (hf != INVALID_HANDLE_VALUE) {
+					flush_full_test_log(hf);
+					CloseHandle(hf);
+				}
 				return interactive_cancel_cleanup_post_t::already_inflight;
+			}
 
 			bool posted = false;
 			try {
@@ -4725,6 +4884,9 @@ namespace test_all_features {
 				submission.priority = 1;
 				submission.failure_policy = "reject_not_started";
 				submission.shutdown_policy = "drain";
+				submission.cancel_hook = []() {
+					g_interactive_cancel_cleanup_inflight.store(false, std::memory_order_release);
+				};
 				submission.body = std::move(task);
 				posted = aida::infra::executor::submit(std::move(submission)).submitted;
 			} catch (...) {
@@ -4733,13 +4895,36 @@ namespace test_all_features {
 
 			if (!posted) {
 				g_interactive_cancel_cleanup_inflight.store(false, std::memory_order_release);
+				HANDLE hf = open_log_file();
+				log_msg(hf, "cancel", "cleanup post rejected run_id=%llu inflight_after=0 running=%d cancel=%d",
+					static_cast<unsigned long long>(g_run_id.load(std::memory_order_acquire)),
+					g_running.load(std::memory_order_acquire) ? 1 : 0,
+					g_cancel_requested.load(std::memory_order_acquire) ? 1 : 0);
+				if (hf != INVALID_HANDLE_VALUE) {
+					flush_full_test_log(hf);
+					CloseHandle(hf);
+				}
 				return interactive_cancel_cleanup_post_t::rejected;
+			}
+			HANDLE hf = open_log_file();
+			log_msg(hf, "cancel", "cleanup post accepted run_id=%llu inflight=1 running=%d cancel=%d",
+				static_cast<unsigned long long>(g_run_id.load(std::memory_order_acquire)),
+				g_running.load(std::memory_order_acquire) ? 1 : 0,
+				g_cancel_requested.load(std::memory_order_acquire) ? 1 : 0);
+			if (hf != INVALID_HANDLE_VALUE) {
+				flush_full_test_log(hf);
+				CloseHandle(hf);
 			}
 			return interactive_cancel_cleanup_post_t::posted;
 		}
 
 		void request_interactive_cancel() {
-			g_cancel_requested.store(true, std::memory_order_release);
+			const bool was_requested = g_cancel_requested.exchange(true, std::memory_order_acq_rel);
+			diag::log_tagged_fmt("test_all", "cancel request source=interactive previous=%d current=1 run_id=%llu running=%d start_queued=%d",
+				was_requested ? 1 : 0,
+				static_cast<unsigned long long>(g_run_id.load(std::memory_order_acquire)),
+				g_running.load(std::memory_order_acquire) ? 1 : 0,
+				g_start_queued.load(std::memory_order_acquire) ? 1 : 0);
 			set_phase("Cancelling...");
 			const interactive_cancel_cleanup_post_t post_state = post_interactive_cancel_cleanup();
 			if (post_state == interactive_cancel_cleanup_post_t::posted)
@@ -4748,21 +4933,6 @@ namespace test_all_features {
 				set_step("cancel cleanup already queued");
 			else
 				set_step("cancel cleanup queue unavailable");
-		}
-
-		void cancel_tests_blocking_shutdown_impl() {
-			g_cancel_requested.store(true, std::memory_order_release);
-			diag::log_tagged_fmt("test_all", "user cancelled Test All Features");
-			try {
-				const ULONGLONG t0 = GetTickCount64();
-				aida::burp::camoufox::force_cleanup("testlab.cancel.inline");
-				diag::log_tagged_fmt("test_all", "cancel cleanup completed elapsed_ms=%llu",
-					static_cast<unsigned long long>(GetTickCount64() - t0));
-			} catch (const std::exception& ex) {
-				diag::log_tagged_fmt("test_all", "cancel cleanup exception: %s", ex.what());
-			} catch (...) {
-				diag::log_tagged("test_all", "cancel cleanup exception: unknown");
-			}
 		}
 
 	}
@@ -4869,7 +5039,14 @@ namespace test_all_features {
 	}
 
 	void cancel_tests() {
-		cancel_tests_blocking_shutdown_impl();
+		request_interactive_cancel();
+	}
+
+	void cancel_tests_for_shutdown() {
+		g_shutdown_cancel_requested.store(true, std::memory_order_release);
+		g_cancel_requested.store(true, std::memory_order_release);
+		g_start_queued.store(false, std::memory_order_release);
+		set_phase("Cancelling...");
 	}
 
 	bool is_running() {

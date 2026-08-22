@@ -286,6 +286,17 @@ namespace driver_bridge
         std::vector<pcap_packet_t> packets;
     };
 
+    struct availability_t {
+        bool initialized = false;
+        bool kernel_backend = false;
+        bool device_connected = false;
+        bool target_attached = false;
+        uint32_t target_pid = 0;
+        std::string state;
+        std::string reason;
+        std::string detail;
+    };
+
     struct fingerprint_info_t {
         uint8_t     remote_addr[16] = {};
         uint32_t    af = 0;
@@ -309,6 +320,7 @@ namespace driver_bridge
     void shutdown(const char* reason = nullptr);
     bool is_loaded();
     bool using_kernel_driver();
+    availability_t availability();
     bool kernel_session_available(std::string* reason = nullptr);
     bool can_read_memory();
     bool attach(uint32_t pid);

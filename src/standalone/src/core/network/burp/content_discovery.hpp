@@ -66,6 +66,8 @@ struct disc_status_t
     int                 errors = 0;
     uint64_t            started_unix_ms = 0;
     uint64_t            finished_unix_ms = 0;
+    bool                finished = false;
+    bool                cancelled = false;
     size_t              calibrated_size_lo = 0;
     size_t              calibrated_size_hi = 0;
     std::string         last_error;

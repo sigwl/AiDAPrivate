@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
 #include <utility>
@@ -131,7 +132,9 @@ public:
         accounted_bytes_.fetch_add(bytes, std::memory_order_acq_rel);
     }
     std::uint64_t live_fresh_bytes() const noexcept;
-    std::uint32_t aliased_domains() const noexcept { return aliased_domains_; }
+    std::uint32_t aliased_domains() const noexcept {
+        return aliased_domains_.load(std::memory_order_acquire);
+    }
 
 private:
     publication_indexes_t() = default;
@@ -170,10 +173,11 @@ private:
     mutable std::uint64_t call_graph_memo_bytes_ = 0;
     mutable std::shared_ptr<const std::vector<xref_db::call_graph_node_t>> call_graph_memo_;
 
+    mutable std::mutex fresh_arrays_mutex_;
     std::vector<std::pair<std::shared_ptr<const void>, std::uint64_t>> fresh_arrays_;
     mutable std::atomic<std::uint64_t> bytes_{0};
     mutable std::atomic<std::uint64_t> accounted_bytes_{0};
-    std::uint32_t aliased_domains_ = 0;
+    std::atomic<std::uint32_t> aliased_domains_{0};
 };
 
 workspace_result_t<std::shared_ptr<const publication_indexes_t>> for_publication_result(

@@ -15,7 +15,6 @@
 #include "../../infra/executor.hpp"
 #include "../../mcp/downstream_producer_governor.hpp"
 #include "../../../helpers/diag_log.hpp"
-#include "../../infra/executor.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -56,6 +55,9 @@ struct audit_runtime_t
     std::atomic<size_t>         in_flight{0};
     std::atomic<size_t>         active_workers{0};
     std::atomic<size_t>         queued_workers{0};
+    std::atomic<bool>           audit_worker_active{false};
+    std::atomic<bool>           capacity_owned{false};
+    std::atomic<bool>           drain_finalizing{false};
     std::atomic<size_t>         module_request_count{0};
     std::atomic<size_t>         transport_backoff_ms{0};
     std::atomic<size_t>         wsaenobufs_preinit_hits{0};
@@ -64,10 +66,13 @@ struct audit_runtime_t
     std::mutex                  pmc_mtx;
     std::mutex                  status_mtx;
     std::condition_variable     cancel_cv;
+    std::shared_ptr<mcp_standalone::downstream::scoped_admission_t> admission;
+    uint64_t                    admission_token = 0;
 };
 
 struct state_t
 {
+    std::mutex                                                            lifecycle_mtx;
     std::mutex                                                            audits_mtx;
     std::unordered_map<uint64_t, std::shared_ptr<audit_runtime_t>>        audits;
     std::atomic<uint64_t>                                                 next_id{1};
@@ -114,12 +119,9 @@ scanner_load_t collect_load_snapshot()
             continue;
         const size_t active_workers = rt->active_workers.load(std::memory_order_acquire);
         load.active_workers += active_workers;
-        load.queue_depth += active_workers;
-        {
-            std::lock_guard<std::mutex> st_lk(rt->status_mtx);
-            if (rt->status.running)
-                ++load.running_audits;
-        }
+        load.queue_depth += rt->queued_workers.load(std::memory_order_acquire);
+        if (rt->capacity_owned.load(std::memory_order_acquire))
+            ++load.running_audits;
     }
     return load;
 }
@@ -359,7 +361,14 @@ bool wait_for_inflight_slot(audit_runtime_t& rt, size_t cap)
             }
             continue;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::unique_lock<std::mutex> lk(rt.status_mtx);
+        rt.cancel_cv.wait_for(lk, std::chrono::milliseconds(10), [&rt, &s, per_audit_cap]() {
+            return rt.cancel_flag.load(std::memory_order_acquire) ||
+                   rt.transport_circuit_breaker_open.load(std::memory_order_acquire) ||
+                   s.shutting_down.load(std::memory_order_acquire) ||
+                   (rt.in_flight.load(std::memory_order_acquire) < per_audit_cap &&
+                    s.global_in_flight.load(std::memory_order_acquire) < kMaxGlobalInFlightRequests);
+        });
     }
 }
 
@@ -367,7 +376,20 @@ void release_inflight(audit_runtime_t& rt)
 {
     rt.in_flight.fetch_sub(1, std::memory_order_acq_rel);
     state().global_in_flight.fetch_sub(1, std::memory_order_acq_rel);
+    rt.cancel_cv.notify_all();
 }
+
+struct inflight_guard_t
+{
+    audit_runtime_t* rt = nullptr;
+    bool active = false;
+
+    ~inflight_guard_t()
+    {
+        if (active)
+            release_inflight(*rt);
+    }
+};
 
 size_t issue_count_for_audit(uint64_t audit_id)
 {
@@ -410,8 +432,14 @@ scanner::send_fn_t make_send_fn(std::shared_ptr<audit_runtime_t> rt_ptr,
         if (rt_ptr->config.per_module_request_cap > 0 &&
             increment_pmc(*rt_ptr, mod_id) > rt_ptr->config.per_module_request_cap) return std::nullopt;
         const size_t throttle_ms = rt_ptr->config.request_throttle_ms + rt_ptr->transport_backoff_ms.load(std::memory_order_acquire);
-        if (throttle_ms > 0)
-            std::this_thread::sleep_for(std::chrono::milliseconds(throttle_ms));
+        if (throttle_ms > 0) {
+            std::unique_lock<std::mutex> lk(rt_ptr->status_mtx);
+            if (rt_ptr->cancel_cv.wait_for(lk, std::chrono::milliseconds(throttle_ms), [rt_ptr]() {
+                    return rt_ptr->cancel_flag.load(std::memory_order_acquire) ||
+                           rt_ptr->transport_circuit_breaker_open.load(std::memory_order_acquire);
+                }))
+                return std::nullopt;
+        }
         bool slot_acquired = false;
         if (acquire_slot) {
             slot_acquired = wait_for_inflight_slot(*rt_ptr, rt_ptr->config.max_concurrent_requests);
@@ -421,6 +449,7 @@ scanner::send_fn_t make_send_fn(std::shared_ptr<audit_runtime_t> rt_ptr,
                 return std::nullopt;
             }
         }
+        inflight_guard_t slot_guard{rt_ptr.get(), slot_acquired};
         audit_http::send_options_t opt;
         opt.timeout_ms = rt_ptr->config.timeout_ms;
         opt.follow_redirects = rt_ptr->config.follow_redirects;
@@ -449,8 +478,6 @@ scanner::send_fn_t make_send_fn(std::shared_ptr<audit_runtime_t> rt_ptr,
                 static_cast<unsigned long long>(rt_ptr->status.id), mod_id.c_str(), raw_req.size(), socket_error.c_str(),
                 static_cast<unsigned long long>(elapsed), static_cast<unsigned long>(GetCurrentThreadId()));
         }
-        if (slot_acquired)
-            release_inflight(*rt_ptr);
         if (count_completed) {
             std::lock_guard<std::mutex> lk(rt_ptr->status_mtx);
             rt_ptr->status.completed_probes++;
@@ -518,10 +545,18 @@ void run_module_for_point(std::shared_ptr<audit_runtime_t> rt_ptr,
             static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str(), rt_ptr->raw_request.size(), static_cast<unsigned long>(GetCurrentThreadId()));
         return;
     }
+    inflight_guard_t baseline_slot_guard{rt_ptr.get(), true};
     const uint64_t baseline_started = now_ms();
     const size_t baseline_throttle_ms = rt_ptr->config.request_throttle_ms + rt_ptr->transport_backoff_ms.load(std::memory_order_acquire);
-    if (baseline_throttle_ms > 0)
-        std::this_thread::sleep_for(std::chrono::milliseconds(baseline_throttle_ms));
+    if (baseline_throttle_ms > 0) {
+        std::unique_lock<std::mutex> lk(rt_ptr->status_mtx);
+        if (rt_ptr->cancel_cv.wait_for(lk, std::chrono::milliseconds(baseline_throttle_ms), [rt_ptr]() {
+                return rt_ptr->cancel_flag.load(std::memory_order_acquire) ||
+                       rt_ptr->transport_circuit_breaker_open.load(std::memory_order_acquire) ||
+                       state().shutting_down.load(std::memory_order_acquire);
+            }))
+            return;
+    }
     const auto baseline_load = collect_load_snapshot();
     diag::log_tagged_fmt("scanner", "run_module_for_point baseline_begin audit=%llu module=%s req_len=%zu active_audits=%zu running_audits=%zu queue_depth=%zu in_flight=%zu tid=%lu",
         static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str(), rt_ptr->raw_request.size(),
@@ -530,6 +565,7 @@ void run_module_for_point(std::shared_ptr<audit_runtime_t> rt_ptr,
     auto baseline = audit_http::send(rt_ptr->raw_request, rt_ptr->status.host,
                                      rt_ptr->status.port, rt_ptr->status.tls, base_opt);
     release_inflight(*rt_ptr);
+    baseline_slot_guard.active = false;
     const uint64_t baseline_elapsed = now_ms() - baseline_started;
     if (baseline.has_value()) {
         record_transport_result(rt_ptr, true, std::string(), "baseline", mod.id);
@@ -592,12 +628,14 @@ void run_module_for_point(std::shared_ptr<audit_runtime_t> rt_ptr,
                 static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str());
             return;
         }
+        inflight_guard_t probe_slot_guard{rt_ptr.get(), true};
 
         diag::log_tagged_fmt("scanner", "run_module_for_point sending_probe audit=%llu module=%s probe_idx=%d payload_len=%zu",
             static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str(), issued, p.payload.size());
         auto built = ip.build ? ip.build(p.payload) : std::vector<uint8_t>(ip.base_request.begin(), ip.base_request.end());
         auto resp = send_fn(built, p);
         release_inflight(*rt_ptr);
+        probe_slot_guard.active = false;
         {
             std::lock_guard<std::mutex> lk(rt_ptr->status_mtx);
             rt_ptr->status.completed_probes++;
@@ -624,7 +662,66 @@ void run_module_for_point(std::shared_ptr<audit_runtime_t> rt_ptr,
         static_cast<unsigned long long>(rt_ptr->status.id), mod.id.c_str(), ip.kind.c_str(), ip.name.c_str(), issued);
 }
 
-void run_audit(std::shared_ptr<audit_runtime_t> rt_ptr)
+void terminalize_audit(const std::shared_ptr<audit_runtime_t>& rt_ptr, const char* reason)
+{
+    if (!rt_ptr)
+        return;
+    rt_ptr->cancel_flag.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(rt_ptr->status_mtx);
+        rt_ptr->status.cancel_requested = true;
+        rt_ptr->status.cancelled = true;
+    }
+    rt_ptr->cancel_cv.notify_all();
+    diag::log_tagged_fmt("scanner", "active_scanner audit_terminalized id=%llu reason=%s active_workers=%zu queued_workers=%zu in_flight=%zu",
+        static_cast<unsigned long long>(rt_ptr->status.id),
+        reason ? reason : "unknown",
+        rt_ptr->active_workers.load(std::memory_order_acquire),
+        rt_ptr->queued_workers.load(std::memory_order_acquire),
+        rt_ptr->in_flight.load(std::memory_order_acquire));
+}
+
+void complete_drain_if_ready(const std::shared_ptr<audit_runtime_t>& rt_ptr, const char* reason)
+{
+    if (!rt_ptr || rt_ptr->audit_worker_active.load(std::memory_order_acquire) ||
+        rt_ptr->queued_workers.load(std::memory_order_acquire) != 0 ||
+        rt_ptr->active_workers.load(std::memory_order_acquire) != 0 ||
+        rt_ptr->in_flight.load(std::memory_order_acquire) != 0)
+        return;
+
+    bool expected = false;
+    if (!rt_ptr->drain_finalizing.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+
+    sync_issue_count_from_store(rt_ptr, "audit_drained");
+    std::shared_ptr<mcp_standalone::downstream::scoped_admission_t> admission;
+    uint64_t admission_token = 0;
+    {
+        std::lock_guard<std::mutex> lk(rt_ptr->status_mtx);
+        rt_ptr->status.running = false;
+        rt_ptr->status.cancel_requested = rt_ptr->status.cancel_requested || rt_ptr->cancel_flag.load(std::memory_order_acquire);
+        rt_ptr->status.cancelled = rt_ptr->cancel_flag.load(std::memory_order_acquire);
+        rt_ptr->status.drained = true;
+        if (rt_ptr->status.ended_ms == 0)
+            rt_ptr->status.ended_ms = now_ms();
+        admission = std::move(rt_ptr->admission);
+        admission_token = rt_ptr->admission_token;
+        rt_ptr->admission_token = 0;
+    }
+    if (admission) {
+        diag::log_tagged_fmt("scanner", "BURP-NETWORK-WORKER-RELEASE audit_id=%llu token=%llu reason=%s",
+            static_cast<unsigned long long>(rt_ptr->status.id),
+            static_cast<unsigned long long>(admission_token),
+            reason ? reason : "drained");
+        admission->release(reason ? reason : "drained");
+    }
+    rt_ptr->capacity_owned.store(false, std::memory_order_release);
+    rt_ptr->cancel_cv.notify_all();
+    diag::log_tagged_fmt("scanner", "active_scanner audit_drained id=%llu reason=%s",
+        static_cast<unsigned long long>(rt_ptr->status.id), reason ? reason : "drained");
+}
+
+void run_audit_impl(std::shared_ptr<audit_runtime_t> rt_ptr)
 {
     auto modules_all = scanner::all_modules();
     std::vector<scanner::module_t> enabled;
@@ -661,8 +758,20 @@ void run_audit(std::shared_ptr<audit_runtime_t> rt_ptr)
             std::shared_ptr<audit_runtime_t> captured = rt_ptr;
             scanner::module_t mod_copy = mod;
             insertion_point_t ip_copy = ip;
-            rt_ptr->queued_workers.fetch_add(1, std::memory_order_relaxed);
-            rt_ptr->active_workers.fetch_add(1, std::memory_order_relaxed);
+            rt_ptr->queued_workers.fetch_add(1, std::memory_order_acq_rel);
+            struct queued_worker_guard_t
+            {
+                std::shared_ptr<audit_runtime_t> rt;
+                bool active = true;
+
+                ~queued_worker_guard_t()
+                {
+                    if (active) {
+                        rt->queued_workers.fetch_sub(1, std::memory_order_acq_rel);
+                        rt->cancel_cv.notify_all();
+                    }
+                }
+            } queued_guard{rt_ptr};
             const bool posted = [&]() {
                 ::aida::infra::executor::submission_t sub;
                 sub.owner_subsystem = "burp.active_scanner";
@@ -671,22 +780,40 @@ void run_audit(std::shared_ptr<audit_runtime_t> rt_ptr)
                 sub.domain = aida::infra::executor::domain_t::feature_worker;
                 sub.priority = 3;
                 sub.body = [captured, mod_copy, ip_copy]() {
-                struct worker_guard_t
-                {
-                    std::shared_ptr<audit_runtime_t> rt;
-                    ~worker_guard_t()
-                    {
-                        rt->active_workers.fetch_sub(1, std::memory_order_acq_rel);
-                        rt->cancel_cv.notify_all();
-                    }
-                } guard{captured};
-                run_module_for_point(captured, mod_copy, ip_copy);
-            };
+                 struct worker_guard_t
+                 {
+                     std::shared_ptr<audit_runtime_t> rt;
+                     explicit worker_guard_t(std::shared_ptr<audit_runtime_t> runtime)
+                         : rt(std::move(runtime))
+                     {
+                         rt->active_workers.fetch_add(1, std::memory_order_acq_rel);
+                         rt->queued_workers.fetch_sub(1, std::memory_order_acq_rel);
+                         rt->cancel_cv.notify_all();
+                     }
+                      ~worker_guard_t()
+                      {
+                          rt->active_workers.fetch_sub(1, std::memory_order_acq_rel);
+                          rt->cancel_cv.notify_all();
+                          complete_drain_if_ready(rt, "probe_workers_drained");
+                      }
+                 } guard{captured};
+                 try {
+                     run_module_for_point(captured, mod_copy, ip_copy);
+                 } catch (const std::exception& ex) {
+                     diag::log_tagged_fmt("scanner", "active_scanner probe_worker_exception audit=%llu module=%s err=%s",
+                         static_cast<unsigned long long>(captured->status.id), mod_copy.id.c_str(), ex.what());
+                     terminalize_audit(captured, "probe_worker_exception");
+                 } catch (...) {
+                     diag::log_tagged_fmt("scanner", "active_scanner probe_worker_exception audit=%llu module=%s err=unknown",
+                         static_cast<unsigned long long>(captured->status.id), mod_copy.id.c_str());
+                     terminalize_audit(captured, "probe_worker_exception_unknown");
+                 }
+             };
                 return ::aida::infra::executor::submit(std::move(sub)).submitted;
             }();
+            if (posted)
+                queued_guard.active = false;
             if (!posted) {
-                rt_ptr->active_workers.fetch_sub(1, std::memory_order_acq_rel);
-                rt_ptr->cancel_cv.notify_all();
                 diag::log_tagged_fmt("burp", "active_scanner worker_post_failed id=%llu module=%s ip=%s/%s",
                     static_cast<unsigned long long>(rt_ptr->status.id),
                     mod.id.c_str(),
@@ -703,15 +830,16 @@ void run_audit(std::shared_ptr<audit_runtime_t> rt_ptr)
 
     auto cancel_wait_started = std::chrono::steady_clock::time_point{};
     while (true) {
+        const size_t queued_workers = rt_ptr->queued_workers.load(std::memory_order_acquire);
         const size_t active_workers = rt_ptr->active_workers.load(std::memory_order_acquire);
         const size_t in_flight = rt_ptr->in_flight.load(std::memory_order_acquire);
-        if (active_workers == 0 && in_flight == 0) break;
+        if (queued_workers == 0 && active_workers == 0 && in_flight == 0) break;
         if (rt_ptr->cancel_flag.load(std::memory_order_acquire)) {
             if (cancel_wait_started == std::chrono::steady_clock::time_point{})
                 cancel_wait_started = std::chrono::steady_clock::now();
             if (std::chrono::steady_clock::now() - cancel_wait_started > std::chrono::seconds(15)) {
-                diag::log_tagged_fmt("burp", "active_scanner cancel_drain_timeout id=%llu active_workers=%zu in_flight=%zu",
-                    static_cast<unsigned long long>(rt_ptr->status.id), active_workers, in_flight);
+                diag::log_tagged_fmt("burp", "active_scanner cancel_drain_timeout id=%llu queued_workers=%zu active_workers=%zu in_flight=%zu",
+                    static_cast<unsigned long long>(rt_ptr->status.id), queued_workers, active_workers, in_flight);
                 break;
             }
         }
@@ -720,13 +848,10 @@ void run_audit(std::shared_ptr<audit_runtime_t> rt_ptr)
 
     {
         std::lock_guard<std::mutex> lk(rt_ptr->status_mtx);
-        rt_ptr->status.running = false;
         const bool cancel_requested = rt_ptr->cancel_flag.load();
         rt_ptr->status.cancel_requested = rt_ptr->status.cancel_requested || cancel_requested;
         rt_ptr->status.cancelled = cancel_requested;
-        rt_ptr->status.drained = rt_ptr->active_workers.load(std::memory_order_acquire) == 0 &&
-                                 rt_ptr->in_flight.load(std::memory_order_acquire) == 0;
-        rt_ptr->status.ended_ms = now_ms();
+        rt_ptr->status.drained = false;
     }
     rt_ptr->cancel_cv.notify_all();
     sync_issue_count_from_store(rt_ptr, "audit_end");
@@ -751,7 +876,7 @@ void run_audit(std::shared_ptr<audit_runtime_t> rt_ptr)
                 rt_ptr->status.last_transport_error.c_str());
         }
     }
-    diag::log_tagged_fmt("burp", "active_scanner audit_end id=%llu issues=%zu responses=%zu no_response=%zu transport_failures=%zu transport_error_code=%u transport_error_class=%s circuit_open=%d circuit_hits=%zu circuit_threshold=%zu last_transport_error=%s cancelled=%d cancel_requested=%d drained=%d active_workers=%zu in_flight=%zu active_audits=%zu running_audits=%zu queue_depth=%zu elapsed_ms=%llu tid=%lu",
+    diag::log_tagged_fmt("burp", "active_scanner audit_coordinator_exit id=%llu issues=%zu responses=%zu no_response=%zu transport_failures=%zu transport_error_code=%u transport_error_class=%s circuit_open=%d circuit_hits=%zu circuit_threshold=%zu last_transport_error=%s cancelled=%d cancel_requested=%d drain_pending=1 active_workers=%zu in_flight=%zu active_audits=%zu running_audits=%zu queue_depth=%zu elapsed_ms=%llu tid=%lu",
         static_cast<unsigned long long>(rt_ptr->status.id),
         rt_ptr->status.issues_found,
         rt_ptr->status.responses_received,
@@ -765,14 +890,28 @@ void run_audit(std::shared_ptr<audit_runtime_t> rt_ptr)
         rt_ptr->status.last_transport_error.c_str(),
         rt_ptr->status.cancelled ? 1 : 0,
         rt_ptr->status.cancel_requested ? 1 : 0,
-        rt_ptr->status.drained ? 1 : 0,
         rt_ptr->active_workers.load(std::memory_order_acquire),
         rt_ptr->in_flight.load(std::memory_order_acquire),
         end_load.active_audits,
         end_load.running_audits,
         end_load.queue_depth,
-        static_cast<unsigned long long>(rt_ptr->status.ended_ms > rt_ptr->status.started_ms ? rt_ptr->status.ended_ms - rt_ptr->status.started_ms : 0),
+        static_cast<unsigned long long>(now_ms() - rt_ptr->status.started_ms),
         static_cast<unsigned long>(GetCurrentThreadId()));
+}
+
+void run_audit(std::shared_ptr<audit_runtime_t> rt_ptr)
+{
+    try {
+        run_audit_impl(rt_ptr);
+    } catch (const std::exception& ex) {
+        diag::log_tagged_fmt("scanner", "active_scanner audit_worker_exception audit=%llu err=%s",
+            static_cast<unsigned long long>(rt_ptr->status.id), ex.what());
+        terminalize_audit(rt_ptr, "audit_worker_exception");
+    } catch (...) {
+        diag::log_tagged_fmt("scanner", "active_scanner audit_worker_exception audit=%llu err=unknown",
+            static_cast<unsigned long long>(rt_ptr->status.id));
+        terminalize_audit(rt_ptr, "audit_worker_exception_unknown");
+    }
 }
 
 }
@@ -781,6 +920,7 @@ bool initialize()
 {
     diag::log_tagged_fmt("scanner", "active_scanner initialize called");
     auto& s = state();
+    std::lock_guard<std::mutex> lifecycle_lock(s.lifecycle_mtx);
     bool expected = false;
     if (!s.initialized.compare_exchange_strong(expected, true)) {
         const bool stopping = s.shutting_down.load(std::memory_order_acquire);
@@ -796,29 +936,37 @@ void shutdown()
 {
     diag::log_tagged_fmt("scanner", "active_scanner shutdown called");
     auto& s = state();
+    std::lock_guard<std::mutex> lifecycle_lock(s.lifecycle_mtx);
     if (!s.initialized.load()) {
         diag::log_tagged_fmt("scanner", "active_scanner shutdown skipped not_initialized");
         return;
     }
     bool expected = false;
-    if (!s.shutting_down.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        diag::log_tagged_fmt("scanner", "active_scanner shutdown skipped already_shutting_down");
-        return;
-    }
+    if (!s.shutting_down.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        diag::log_tagged_fmt("scanner", "active_scanner shutdown retry already_shutting_down");
     std::vector<std::shared_ptr<audit_runtime_t>> alive;
     {
         std::lock_guard<std::mutex> lk(s.audits_mtx);
         for (auto& kv : s.audits) alive.push_back(kv.second);
     }
     diag::log_tagged_fmt("scanner", "active_scanner shutdown cancelling %zu audits", alive.size());
-    for (auto& rt : alive) rt->cancel_flag.store(true);
+    for (auto& rt : alive) {
+        rt->cancel_flag.store(true, std::memory_order_release);
+        rt->cancel_cv.notify_all();
+    }
     auto t0 = std::chrono::steady_clock::now();
     bool all_done = false;
     while (true) {
         all_done = true;
         for (auto& rt : alive) {
             std::lock_guard<std::mutex> lk(rt->status_mtx);
-            if (rt->status.running) { all_done = false; break; }
+            if (rt->capacity_owned.load(std::memory_order_acquire) || rt->audit_worker_active.load(std::memory_order_acquire) ||
+                rt->queued_workers.load(std::memory_order_acquire) != 0 ||
+                rt->active_workers.load(std::memory_order_acquire) != 0 ||
+                rt->in_flight.load(std::memory_order_acquire) != 0) {
+                all_done = false;
+                break;
+            }
         }
         if (all_done) break;
         if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(5)) {
@@ -909,23 +1057,28 @@ uint64_t enqueue_target(const std::vector<uint8_t>& raw_request,
     rt->status.effective_max_concurrent = normalized_cfg.max_concurrent_requests;
     rt->status.effective_throttle_ms = normalized_cfg.request_throttle_ms;
     rt->status.transport_circuit_breaker_threshold = kWsaEnobufsPreinitCircuitThreshold;
+    rt->capacity_owned.store(true, std::memory_order_release);
     try {
         std::lock_guard<std::mutex> lk(s.audits_mtx);
+        if (s.shutting_down.load(std::memory_order_acquire)) {
+            diag::log_tagged_fmt("scanner", "enqueue_target rejected shutting_down_during_admission url=%s", url.c_str());
+            set_err("active_scanner.enqueue: scanner is shutting down");
+            return 0;
+        }
         size_t running_audits = 0;
-        size_t active_workers = 0;
+        size_t queued_workers = 0;
         size_t in_flight = s.global_in_flight.load(std::memory_order_acquire);
         for (auto& kv : s.audits) {
             const auto& existing = kv.second;
             if (!existing)
                 continue;
-            active_workers += existing->active_workers.load(std::memory_order_acquire);
-            std::lock_guard<std::mutex> st_lk(existing->status_mtx);
-            if (existing->status.running)
+            queued_workers += existing->queued_workers.load(std::memory_order_acquire);
+            if (existing->capacity_owned.load(std::memory_order_acquire))
                 ++running_audits;
         }
         if (running_audits >= kMaxActiveAudits) {
             diag::log_tagged_fmt("scanner", "enqueue_target rejected busy url=%s req_len=%zu running_audits=%zu active_audits=%zu queue_depth=%zu in_flight=%zu max_active=%zu elapsed_ms=%llu tid=%lu",
-                url.c_str(), raw_request.size(), running_audits, s.audits.size(), active_workers, in_flight, kMaxActiveAudits,
+                url.c_str(), raw_request.size(), running_audits, s.audits.size(), queued_workers, in_flight, kMaxActiveAudits,
                 static_cast<unsigned long long>(now_ms() - enqueue_started), static_cast<unsigned long>(GetCurrentThreadId()));
             set_err("active_scanner.enqueue: scanner busy", "scanner_busy");
             return 0;
@@ -988,6 +1141,11 @@ uint64_t enqueue_target(const std::vector<uint8_t>& raw_request,
     }
     const uint64_t admission_token = admission.token();
     auto admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(admission));
+    {
+        std::lock_guard<std::mutex> lk(rt->status_mtx);
+        rt->admission = admission_ptr;
+        rt->admission_token = admission_token;
+    }
     diag::log_tagged_fmt("scanner", "BURP-NETWORK-WORKER-ADMIT audit_id=%llu host=%s token=%llu",
         static_cast<unsigned long long>(rt->status.id), host.c_str(),
         static_cast<unsigned long long>(admission_token));
@@ -998,15 +1156,26 @@ uint64_t enqueue_target(const std::vector<uint8_t>& raw_request,
     sub.domain = aida::infra::executor::domain_t::long_running;
     sub.priority = 3;
     sub.lease_token = admission_token;
-    sub.body = [captured, admission_ptr, admission_token]() {
+    sub.body = [captured]() {
+        struct audit_worker_guard_t
+        {
+            std::shared_ptr<audit_runtime_t> rt;
+
+            ~audit_worker_guard_t()
+            {
+                rt->audit_worker_active.store(false, std::memory_order_release);
+                rt->cancel_cv.notify_all();
+                complete_drain_if_ready(rt, "audit_worker_exit");
+            }
+        } audit_worker_guard{captured};
         run_audit(captured);
-        diag::log_tagged_fmt("scanner", "BURP-NETWORK-WORKER-RELEASE audit_id=%llu token=%llu reason=completed",
-            static_cast<unsigned long long>(captured->status.id),
-            static_cast<unsigned long long>(admission_token));
-        admission_ptr->release("completed");
     };
+    rt->audit_worker_active.store(true, std::memory_order_release);
     const bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
     if (!posted) {
+        rt->audit_worker_active.store(false, std::memory_order_release);
+        admission_ptr->release("worker_post_failed");
+        rt->capacity_owned.store(false, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lk(rt->status_mtx);
             rt->status.running = false;
@@ -1016,6 +1185,11 @@ uint64_t enqueue_target(const std::vector<uint8_t>& raw_request,
             rt->status.ended_ms = now_ms();
         }
         rt->cancel_flag.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(rt->status_mtx);
+            rt->admission.reset();
+            rt->admission_token = 0;
+        }
         {
             std::lock_guard<std::mutex> lk(s.audits_mtx);
             s.audits.erase(rt->status.id);
@@ -1075,12 +1249,9 @@ bool wait_for_audit_idle(uint64_t audit_id, uint32_t timeout_ms)
     while (true) {
         const size_t active_workers = rt->active_workers.load(std::memory_order_acquire);
         const size_t in_flight = rt->in_flight.load(std::memory_order_acquire);
-        bool running = false;
-        {
-            std::lock_guard<std::mutex> lk(rt->status_mtx);
-            running = rt->status.running;
-        }
-        if (!running && active_workers == 0 && in_flight == 0) {
+        const bool running = rt->capacity_owned.load(std::memory_order_acquire);
+        const size_t queued_workers = rt->queued_workers.load(std::memory_order_acquire);
+        if (!running && queued_workers == 0 && active_workers == 0 && in_flight == 0) {
             {
                 std::lock_guard<std::mutex> lk(rt->status_mtx);
                 rt->status.drained = true;
@@ -1090,9 +1261,10 @@ bool wait_for_audit_idle(uint64_t audit_id, uint32_t timeout_ms)
             return true;
         }
         if (timeout_ms == 0 || std::chrono::steady_clock::now() >= deadline) {
-            diag::log_tagged_fmt("scanner", "wait_for_audit_idle id=%llu timeout running=%d active_workers=%zu in_flight=%zu",
+            diag::log_tagged_fmt("scanner", "wait_for_audit_idle id=%llu timeout running=%d queued_workers=%zu active_workers=%zu in_flight=%zu",
                 static_cast<unsigned long long>(audit_id),
                 running ? 1 : 0,
+                queued_workers,
                 active_workers,
                 in_flight);
             return false;
@@ -1123,7 +1295,8 @@ std::vector<audit_status_t> list_audits()
         rt->status.transport_circuit_breaker_threshold = kWsaEnobufsPreinitCircuitThreshold;
         audit_status_t st = rt->status;
         st.cancel_requested = st.cancel_requested || rt->cancel_flag.load(std::memory_order_acquire);
-        st.drained = !st.running && active_workers == 0 && in_flight == 0;
+        st.running = rt->capacity_owned.load(std::memory_order_acquire);
+        st.drained = !st.running && queued_workers == 0 && active_workers == 0 && in_flight == 0;
         st.active_workers = active_workers;
         st.queued_workers = queued_workers;
         st.in_flight_requests = in_flight;
@@ -1164,7 +1337,8 @@ bool get_status(uint64_t audit_id, audit_status_t& out)
     rt->status.transport_circuit_breaker_threshold = kWsaEnobufsPreinitCircuitThreshold;
     out = rt->status;
     out.cancel_requested = out.cancel_requested || rt->cancel_flag.load(std::memory_order_acquire);
-    out.drained = !out.running && active_workers == 0 && in_flight == 0;
+    out.running = rt->capacity_owned.load(std::memory_order_acquire);
+    out.drained = !out.running && queued_workers == 0 && active_workers == 0 && in_flight == 0;
     out.active_workers = active_workers;
     out.queued_workers = queued_workers;
     out.in_flight_requests = in_flight;

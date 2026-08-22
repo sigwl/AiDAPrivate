@@ -151,10 +151,7 @@ namespace {
     bool g_burp_dom_xss_browser_infra_failed = false;
     std::string g_burp_dom_xss_dependency_reason;
     std::string g_burp_collaborator_token;
-    std::string g_burp_fixture_base_url;
-    std::string g_burp_fixture_wordlist_path;
-    std::string g_mcp_cert_thumbprint;
-    bool g_mcp_cert_inject_validate_only = false;
+    thread_local mcp_run_fixture_context_t* g_active_mcp_fixture_context = nullptr;
     std::string g_mcp_session_binary_id;
     bool g_mcp_camoufox_bridge_ready_proven = false;
     uint64_t g_mcp_camoufox_bridge_generation = 0;
@@ -170,7 +167,11 @@ namespace {
     std::atomic<uint64_t> g_mcp_phase_instance_counter{0};
     std::atomic<int> g_mcp_phase_enter_count{0};
     std::atomic<bool> g_mcp_phase_active{false};
-    bool (*g_mcp_cancelled_fn)() = nullptr;
+    std::function<bool()> g_mcp_cancelled_fn;
+
+    bool mcp_cancelled_bridge() {
+        return g_mcp_cancelled_fn && g_mcp_cancelled_fn();
+    }
     std::atomic<bool> g_mcp_coverage_audit_started{false};
     std::atomic<bool> g_mcp_coverage_audit_completed{false};
     constexpr int k_mcp_planned_tool_tests = 579;
@@ -19115,33 +19116,56 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         }
     };
 
-    std::unique_ptr<mcp_burp_http_fixture_t> g_burp_http_fixture;
+    mcp_run_fixture_context_t& active_mcp_fixture_context() {
+        static mcp_run_fixture_context_t unavailable;
+        return g_active_mcp_fixture_context ? *g_active_mcp_fixture_context : unavailable;
+    }
+
+    std::shared_ptr<void>& active_burp_http_fixture_owner() {
+        auto& context = active_mcp_fixture_context();
+        return context.burp_http_fixture_owner;
+    }
+
+    std::shared_ptr<mcp_burp_http_fixture_t> active_burp_http_fixture() {
+        return std::static_pointer_cast<mcp_burp_http_fixture_t>(active_burp_http_fixture_owner());
+    }
+
+#define g_burp_http_fixture active_burp_http_fixture()
+#define g_burp_fixture_base_url active_mcp_fixture_context().burp_fixture_base_url
+#define g_burp_fixture_wordlist_path active_mcp_fixture_context().burp_fixture_wordlist_path
+#define g_mcp_cert_thumbprint active_mcp_fixture_context().cert_thumbprint
+#define g_mcp_cert_inject_validate_only active_mcp_fixture_context().cert_inject_validate_only
 
     bool ensure_burp_http_fixture(HANDLE hf, const char* tag) {
-        if (g_burp_http_fixture && g_burp_http_fixture->port != 0) {
-            if (g_burp_http_fixture->live())
+        auto fixture = active_burp_http_fixture();
+        auto& context = active_mcp_fixture_context();
+        if (fixture && fixture->port != 0) {
+            if (fixture->live())
                 return true;
             log_msg(hf, tag, "INFO -- Burp HTTP fixture stale before reuse port=%u worker_done=%d listener=%d; recreating",
-                static_cast<unsigned>(g_burp_http_fixture->port),
-                g_burp_http_fixture->worker_done.load(std::memory_order_acquire) ? 1 : 0,
-                g_burp_http_fixture->listener == INVALID_SOCKET ? 0 : 1);
-            g_burp_http_fixture.reset();
-            g_burp_fixture_base_url.clear();
-            g_burp_fixture_wordlist_path.clear();
+                static_cast<unsigned>(fixture->port),
+                fixture->worker_done.load(std::memory_order_acquire) ? 1 : 0,
+                fixture->listener == INVALID_SOCKET ? 0 : 1);
+            context.burp_http_fixture_owner.reset();
+            context.burp_fixture_base_url.clear();
+            context.burp_fixture_wordlist_path.clear();
         }
-        g_burp_http_fixture = std::make_unique<mcp_burp_http_fixture_t>();
-        if (!g_burp_http_fixture->start(hf, tag)) {
-            g_burp_http_fixture.reset();
+        auto owner = std::make_shared<mcp_burp_http_fixture_t>();
+        if (!owner->start(hf, tag)) {
             return false;
         }
-        g_burp_fixture_base_url = "http://127.0.0.1:" + std::to_string(g_burp_http_fixture->port);
-        g_burp_fixture_wordlist_path = temp_file_narrow("aida_mcp_burp_words.txt");
-        write_text_file_narrow(g_burp_fixture_wordlist_path, "aida-mcp-test\n");
+        context.burp_fixture_base_url = "http://127.0.0.1:" + std::to_string(owner->port);
+        context.burp_fixture_wordlist_path = temp_file_narrow("aida_mcp_burp_words.txt");
+        write_text_file_narrow(context.burp_fixture_wordlist_path, "aida-mcp-test\n");
+        active_burp_http_fixture_owner() = std::move(owner);
         return true;
     }
 
     bool probe_burp_fixture_connect(HANDLE hf, const char* tag) {
-        if (!ensure_burp_http_fixture(hf, tag) || !g_burp_http_fixture || g_burp_http_fixture->port == 0)
+        if (!ensure_burp_http_fixture(hf, tag))
+            return false;
+        auto fixture = active_burp_http_fixture();
+        if (!fixture || fixture->port == 0)
             return false;
         if (!ensure_mcp_winsock_ready()) {
             log_msg(hf, tag, "PROBE-FAIL -- WSAStartup failed for fixture probe");
@@ -19149,7 +19173,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         }
         auto probe_existing = [&](int max_attempts, bool after_restart) -> bool {
             int last_err = 0;
-            const unsigned port = static_cast<unsigned>(g_burp_http_fixture->port);
+            const unsigned port = static_cast<unsigned>(fixture->port);
             for (int attempt = 1; attempt <= max_attempts; ++attempt) {
                 SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                 if (s == INVALID_SOCKET) {
@@ -19168,7 +19192,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 sockaddr_in addr{};
                 addr.sin_family = AF_INET;
                 addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-                addr.sin_port = htons(g_burp_http_fixture->port);
+                addr.sin_port = htons(fixture->port);
                 int rc = connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
                 int err = rc == 0 ? 0 : WSAGetLastError();
                 if (rc == 0) {
@@ -19197,8 +19221,8 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                             sent,
                             resp.size(),
                             after_restart ? 1 : 0,
-                            static_cast<unsigned long long>(g_burp_http_fixture->accept_count.load(std::memory_order_acquire)),
-                            static_cast<unsigned long long>(g_burp_http_fixture->request_count.load(std::memory_order_acquire)));
+                            static_cast<unsigned long long>(fixture->accept_count.load(std::memory_order_acquire)),
+                            static_cast<unsigned long long>(fixture->request_count.load(std::memory_order_acquire)));
                         return true;
                     }
                     last_err = WSAGetLastError();
@@ -19224,13 +19248,14 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         };
         if (probe_existing(12, false))
             return true;
-        if (g_burp_http_fixture) {
+        if (fixture) {
             log_msg(hf, tag, "INFO -- Burp HTTP fixture not responsive; restarting");
-            g_burp_http_fixture.reset();
-            g_burp_fixture_base_url.clear();
-            g_burp_fixture_wordlist_path.clear();
-            if (!ensure_burp_http_fixture(hf, tag) || !g_burp_http_fixture || g_burp_http_fixture->port == 0)
+            active_mcp_fixture_context().burp_http_fixture_owner.reset();
+            active_mcp_fixture_context().burp_fixture_base_url.clear();
+            active_mcp_fixture_context().burp_fixture_wordlist_path.clear();
+            if (!ensure_burp_http_fixture(hf, tag) || !active_burp_http_fixture() || active_burp_http_fixture()->port == 0)
                 return false;
+            fixture = active_burp_http_fixture();
             return probe_existing(12, true);
         }
         return false;
@@ -19244,8 +19269,8 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             log_msg(hf, tag, "FIXTURE-FALLBACK -- using closed loopback URL for suffix=%s because Burp HTTP fixture is unavailable", suffix.c_str());
             return "http://127.0.0.1:1" + suffix;
         }
-        log_msg(hf, tag, "FIXTURE-URL -- %s%s", g_burp_fixture_base_url.c_str(), suffix.c_str());
-        return g_burp_fixture_base_url + suffix;
+        log_msg(hf, tag, "FIXTURE-URL -- %s%s", active_mcp_fixture_context().burp_fixture_base_url.c_str(), suffix.c_str());
+        return active_mcp_fixture_context().burp_fixture_base_url + suffix;
     }
 
     bool send_loopback_tcp_payload_to_port(HANDLE hf, const char* tag, uint16_t dst_port, const std::vector<uint8_t>& payload, size_t* response_len) {
@@ -20410,6 +20435,116 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             passed.fetch_add(1);
         } else {
             log_msg(hf, tag, "FAIL -- server running=false port=%d", port);
+            failed.fetch_add(1);
+        }
+    }
+
+    void test_mcp_local_authentication(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        const char* tag = "mcp.local_authentication";
+        constexpr int port = 43127;
+        const std::string capability = "capability-regression-token";
+        const std::string run_binding = "run-regression-binding";
+        const std::string authorization = "Bearer " + capability;
+
+        mcp_standalone::local_request_auth_input_t base;
+        base.remote_address = "127.0.0.1";
+        base.host = "127.0.0.1:" + std::to_string(port);
+        base.bound_port = port;
+        base.method = "GET";
+        base.path = "/api/tools";
+
+        int checks = 0;
+        int failures = 0;
+        auto check = [&](const char* name, bool condition) {
+            ++checks;
+            if (!condition) {
+                ++failures;
+                log_msg(hf, tag, "FAIL -- case=%s", name);
+            }
+        };
+
+        auto missing_token = base;
+        missing_token.run_binding = run_binding;
+        const auto missing_token_result = mcp_standalone::authorize_local_request(
+            missing_token, capability, run_binding);
+        check("missing_token", !missing_token_result.allowed &&
+            missing_token_result.status == mcp_standalone::local_request_auth_status_t::capability_missing);
+
+        auto malformed_auth = base;
+        malformed_auth.authorization = "Basic " + capability;
+        malformed_auth.run_binding = run_binding;
+        const auto malformed_auth_result = mcp_standalone::authorize_local_request(
+            malformed_auth, capability, run_binding);
+        check("malformed_auth", !malformed_auth_result.allowed &&
+            malformed_auth_result.status == mcp_standalone::local_request_auth_status_t::capability_rejected);
+
+        auto wrong_token = base;
+        wrong_token.authorization = "Bearer wrong-token";
+        wrong_token.run_binding = run_binding;
+        const auto wrong_token_result = mcp_standalone::authorize_local_request(
+            wrong_token, capability, run_binding);
+        check("wrong_token", !wrong_token_result.allowed &&
+            wrong_token_result.status == mcp_standalone::local_request_auth_status_t::capability_rejected);
+
+        auto correct_token = base;
+        correct_token.authorization = authorization;
+        correct_token.run_binding = run_binding;
+        const auto correct_token_result = mcp_standalone::authorize_local_request(
+            correct_token, capability, run_binding);
+        check("correct_token", correct_token_result.allowed &&
+            correct_token_result.capability_authenticated &&
+            correct_token_result.status == mcp_standalone::local_request_auth_status_t::allowed);
+
+        auto wrong_run_binding = correct_token;
+        wrong_run_binding.run_binding = "run-other-instance";
+        const auto wrong_run_result = mcp_standalone::authorize_local_request(
+            wrong_run_binding, capability, run_binding);
+        check("wrong_run_binding", !wrong_run_result.allowed &&
+            wrong_run_result.status == mcp_standalone::local_request_auth_status_t::run_binding_rejected);
+
+        auto missing_run_binding = correct_token;
+        missing_run_binding.run_binding.clear();
+        const auto missing_run_result = mcp_standalone::authorize_local_request(
+            missing_run_binding, capability, run_binding);
+        check("missing_run_binding", !missing_run_result.allowed &&
+            missing_run_result.status == mcp_standalone::local_request_auth_status_t::run_binding_missing);
+
+        auto read_only_request = correct_token;
+        read_only_request.method = "GET";
+        read_only_request.path = "/api/tools";
+        const auto read_only_result = mcp_standalone::authorize_local_request(
+            read_only_request, capability, run_binding);
+        check("read_only_route", read_only_result.allowed && read_only_result.capability_authenticated);
+
+        auto mutating_request = correct_token;
+        mutating_request.method = "POST";
+        mutating_request.path = "/api/tools/call";
+        const auto mutating_result = mcp_standalone::authorize_local_request(
+            mutating_request, capability, run_binding);
+        check("mutating_route", mutating_result.allowed && mutating_result.capability_authenticated);
+
+        auto health_request = base;
+        health_request.method = "GET";
+        health_request.path = "/health";
+        const auto health_result = mcp_standalone::authorize_local_request(
+            health_request, capability, run_binding);
+        check("health_read_only_exception", health_result.allowed && !health_result.capability_authenticated &&
+            health_result.status == mcp_standalone::local_request_auth_status_t::health_read_only);
+
+        check("route_capability_correct", mcp_standalone::verify_local_route_capability(
+            authorization, run_binding, {}, capability, run_binding));
+        check("route_capability_wrong_token", !mcp_standalone::verify_local_route_capability(
+            "Bearer wrong-token", run_binding, {}, capability, run_binding));
+        check("route_capability_wrong_instance", !mcp_standalone::verify_local_route_capability(
+            authorization, "run-other-instance", {}, capability, run_binding));
+
+        if (failures == 0) {
+            log_msg(hf, tag, "PASS -- checks=%d missing_token malformed_auth wrong_token correct_token run_binding read_only mutating health route_capability",
+                checks);
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- checks=%d failures=%d", checks, failures);
             failed.fetch_add(1);
         }
     }
@@ -29798,6 +29933,9 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
     void cleanup_mcp_cert_fixture(HANDLE hf, const char* tag) {
         if (g_mcp_cert_thumbprint.empty())
             return;
+        auto& receipt = active_mcp_fixture_context().certificate_cleanup;
+        receipt.attempted = true;
+        receipt.reason = tag ? tag : "certificate cleanup";
         mcp_standalone::json args;
         args["thumbprint"] = g_mcp_cert_thumbprint;
         args["store_name"] = "MY";
@@ -29808,7 +29946,8 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
             result.result.threw ? 1 : 0,
             result.result.success ? 1 : 0,
             result.elapsed_ms);
-        if (!result.timed_out && result.result.found && !result.result.threw && result.result.success)
+        receipt.completed = !result.timed_out && result.result.found && !result.result.threw && result.result.success;
+        if (receipt.completed)
             g_mcp_cert_thumbprint.clear();
     }
 
@@ -35563,8 +35702,19 @@ void log_mcp_phase_remaining_diagnostics(HANDLE hf, int phase_remaining) {
     }
 }
 
-void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& global_skipped, bool(*cancelled)()) {
-    g_mcp_cancelled_fn = cancelled;
+void phase_mcp_tests(HANDLE hf, const mcp_phase_context_t& input_context) {
+    std::string context_reason;
+    if (!input_context.validate(context_reason)) {
+        log_msg(hf, "mcp_phase", "FAIL -- invalid MCP phase context: %s", context_reason.c_str());
+        if (input_context.failed)
+            input_context.failed->fetch_add(1, std::memory_order_acq_rel);
+        return;
+    }
+    g_mcp_cancelled_fn = input_context.cancelled;
+    auto& passed = *input_context.passed;
+    auto& failed = *input_context.failed;
+    auto& global_skipped = *input_context.skipped;
+    bool (*cancelled)() = &mcp_cancelled_bridge;
     const char* phase_tag = "mcp_phase";
     const uint64_t phase_instance = g_mcp_phase_instance_counter.fetch_add(1, std::memory_order_acq_rel) + 1;
     const int enter_count = g_mcp_phase_enter_count.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -35614,6 +35764,17 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     const int start_failed = failed.load(std::memory_order_acquire);
     const int start_skipped = global_skipped.load(std::memory_order_acquire);
     std::atomic<int> skipped{0};
+    mcp_run_fixture_context_t& fixture_context = *input_context.fixture;
+    struct mcp_fixture_context_scope_t {
+        mcp_run_fixture_context_t* previous;
+        explicit mcp_fixture_context_scope_t(mcp_run_fixture_context_t* current)
+            : previous(g_active_mcp_fixture_context) {
+            g_active_mcp_fixture_context = current;
+        }
+        ~mcp_fixture_context_scope_t() {
+            g_active_mcp_fixture_context = previous;
+        }
+    } fixture_context_scope(&fixture_context);
 
     g_invoked_tools.clear();
     g_tool_attempt_stats.clear();
@@ -35682,9 +35843,9 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     g_burp_dom_xss_browser_infra_failed = false;
     g_burp_dom_xss_dependency_reason.clear();
     g_burp_collaborator_token.clear();
-    g_burp_fixture_base_url.clear();
-    g_burp_fixture_wordlist_path.clear();
-    g_burp_http_fixture.reset();
+    active_mcp_fixture_context().burp_fixture_base_url.clear();
+    active_mcp_fixture_context().burp_fixture_wordlist_path.clear();
+    active_burp_http_fixture_owner().reset();
     g_mcp_camoufox_bridge_ready_proven = false;
     g_mcp_camoufox_bridge_generation = 0;
     g_mcp_camoufox_bridge_block_reason.clear();
@@ -35710,9 +35871,9 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
         log_msg(hf, "mcp_phase", "MCP_PHASE_ENTER -- planned=%d instance=%llu server_present=%d server_running=%d port=%d registered_total=%zu registered_external=%zu registered_internal=%zu registered_ide_chat=%zu inventory_hash=0x%016llX target_pid=%u target_unavailable=%d",
             k_mcp_planned_tool_tests,
             static_cast<unsigned long long>(phase_instance),
-            srv ? 1 : 0,
-            srv && srv->is_running() ? 1 : 0,
-            srv ? srv->get_port() : 0,
+            inventory.server_present ? 1 : 0,
+            inventory.server_running ? 1 : 0,
+            inventory.port,
             inventory.total,
             inventory.external_visible,
             inventory.internal_only,
@@ -35724,6 +35885,7 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
 
     if (!cancelled()) test_mcp_server_accessible(hf, passed, failed, skipped);
     if (!cancelled()) test_mcp_server_running(hf, passed, failed, skipped);
+    if (!cancelled()) test_mcp_local_authentication(hf, passed, failed, skipped);
     if (!cancelled()) test_mcp_tool_count(hf, passed, failed, skipped);
     if (!cancelled()) test_mcp_enumerate_tools(hf, passed, failed, skipped);
     if (!cancelled()) test_mcp_categorize_tools(hf, passed, failed, skipped);
@@ -36274,18 +36436,22 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     release_remote_addr("free_scanner_pointer_addr", g_mcp_scanner_pointer_addr);
     release_remote_addr("free_scanner_addr", g_mcp_scanner_addr);
     if (g_burp_http_fixture) {
-        auto fixture_owner = std::shared_ptr<mcp_burp_http_fixture_t>(std::move(g_burp_http_fixture));
+        auto fixture_owner = g_burp_http_fixture;
+        active_burp_http_fixture_owner().reset();
         const uint16_t fixture_port = fixture_owner ? fixture_owner->port : 0;
         const bool fixture_live = fixture_owner ? fixture_owner->live() : false;
         log_msg(hf, "mcp.cleanup", "fixture_reset_schedule active=1 port=%u live=%d",
             static_cast<unsigned>(fixture_port),
             fixture_live ? 1 : 0);
+        fixture_context.burp_http_cleanup.attempted = true;
+        fixture_context.burp_http_cleanup.reason = "mcp finalization";
         const bool ok = bounded_finalizer_call(hf, "burp_http_fixture_reset", 5000, [fixture_owner]() mutable {
             auto owned = fixture_owner;
             fixture_owner.reset();
             owned.reset();
             return true;
         });
+        fixture_context.burp_http_cleanup.completed = ok;
         log_msg(hf, "mcp.cleanup", "fixture_reset_result port=%u completed_ok=%d ownership_released=1",
             static_cast<unsigned>(fixture_port),
             ok ? 1 : 0);

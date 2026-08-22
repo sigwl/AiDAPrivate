@@ -5,6 +5,7 @@
 #include "../../../helpers/diag_log.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -946,12 +947,16 @@ workspace_result_t<std::shared_ptr<const publication_indexes_t>> for_publication
 
 void publication_indexes_t::register_fresh_array(
     const std::shared_ptr<const void>& array, std::uint64_t bytes) {
-    fresh_arrays_.emplace_back(array, bytes);
+    {
+        std::lock_guard<std::mutex> lock(fresh_arrays_mutex_);
+        fresh_arrays_.emplace_back(array, bytes);
+    }
     bytes_.fetch_add(bytes, std::memory_order_relaxed);
     accounted_bytes_.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 std::uint64_t publication_indexes_t::live_fresh_bytes() const noexcept {
+    std::lock_guard<std::mutex> lock(fresh_arrays_mutex_);
     std::uint64_t live = 0;
     for (const auto& item : fresh_arrays_) {
         if (item.first.use_count() > 2)
@@ -1538,37 +1543,31 @@ workspace_result_t<void> publication_indexes_t::build_impl(
     bool alias_symbols = false;
     if (previous && previous->snapshot_) {
         const auto& prior = *previous->snapshot_;
-        alias_xrefs = hints.xrefs_unchanged ||
-            (prior.xrefs.size() == snapshot.xrefs.size() &&
-             domain_content_equal(prior.xrefs.data(), snapshot.xrefs.data(),
-                 snapshot.xrefs.size(), &xref_records_equal, cancel));
-        alias_functions = hints.functions_unchanged ||
-            (prior.functions.size() == snapshot.functions.size() &&
-             domain_content_equal(prior.functions.data(), snapshot.functions.data(),
-                 snapshot.functions.size(),
-                 [&prior, &snapshot](const function_record_t& lhs,
-                                     const function_record_t& rhs) noexcept {
-                     return function_records_equal(prior, lhs, snapshot, rhs);
-                 }, cancel));
-        alias_edges = hints.edges_unchanged ||
-            (prior.edges.size() == snapshot.edges.size() &&
-             domain_content_equal(prior.edges.data(), snapshot.edges.data(),
-                 snapshot.edges.size(), &edge_records_equal, cancel));
-        alias_symbols = hints.symbols_unchanged ||
-            (prior.symbols.size() == snapshot.symbols.size() &&
-             domain_content_equal(prior.symbols.data(), snapshot.symbols.data(),
-                 snapshot.symbols.size(), &symbol_records_equal, cancel));
+        alias_xrefs = prior.xrefs.size() == snapshot.xrefs.size() &&
+            domain_content_equal(prior.xrefs.data(), snapshot.xrefs.data(),
+                snapshot.xrefs.size(), &xref_records_equal, cancel);
+        alias_functions = prior.functions.size() == snapshot.functions.size() &&
+            domain_content_equal(prior.functions.data(), snapshot.functions.data(),
+                snapshot.functions.size(),
+                [&prior, &snapshot](const function_record_t& lhs,
+                                    const function_record_t& rhs) noexcept {
+                    return function_records_equal(prior, lhs, snapshot, rhs);
+                }, cancel);
+        alias_edges = prior.edges.size() == snapshot.edges.size() &&
+            domain_content_equal(prior.edges.data(), snapshot.edges.data(),
+                snapshot.edges.size(), &edge_records_equal, cancel);
+        alias_symbols = prior.symbols.size() == snapshot.symbols.size() &&
+            domain_content_equal(prior.symbols.data(), snapshot.symbols.data(),
+                snapshot.symbols.size(), &symbol_records_equal, cancel);
         if (cancel.stop_requested())
             return workspace_result_t<void>::failure(build_cancel_error(cancel, phase));
     }
     diag::log_tagged_fmt("publication_indexes",
         "gate_decision xrefs=%s functions=%s edges=%s symbols=%s",
-        alias_xrefs ? (hints.xrefs_unchanged ? "alias_hint" : "alias_content") : "rebuild",
-        alias_functions ? (hints.functions_unchanged ? "alias_hint" : "alias_content")
-                        : "rebuild",
-        alias_edges ? (hints.edges_unchanged ? "alias_hint" : "alias_content") : "rebuild",
-        alias_symbols ? (hints.symbols_unchanged ? "alias_hint" : "alias_content")
-                      : "rebuild");
+        alias_xrefs ? "alias_validated" : "rebuild",
+        alias_functions ? "alias_validated" : "rebuild",
+        alias_edges ? "alias_validated" : "rebuild",
+        alias_symbols ? "alias_validated" : "rebuild");
     struct lane_failure_t {
         workspace_error_t error;
     };
@@ -1582,7 +1581,8 @@ workspace_result_t<void> publication_indexes_t::build_impl(
                 output->source_keys_ = previous->source_keys_;
                 output->source_entries_ = previous->source_entries_;
                 output->source_order_verified_ = previous->source_order_verified_;
-                output->aliased_domains_ |= detail::alias_domain_xrefs;
+                output->aliased_domains_.fetch_or(
+                    detail::alias_domain_xrefs, std::memory_order_relaxed);
                 output->bytes_.fetch_add(
                     previous->target_keys_->size() * sizeof(detail::key_entry_t) +
                     previous->target_entries_->size() * sizeof(std::uint32_t) +
@@ -1642,7 +1642,8 @@ workspace_result_t<void> publication_indexes_t::build_impl(
             if (alias_functions && previous) {
                 output->functions_verified_ = previous->functions_verified_;
                 output->function_exact_fallback_ = previous->function_exact_fallback_;
-                output->aliased_domains_ |= detail::alias_domain_functions;
+                output->aliased_domains_.fetch_or(
+                    detail::alias_domain_functions, std::memory_order_relaxed);
                 output->bytes_.fetch_add(
                     previous->function_exact_fallback_
                         ? previous->function_exact_fallback_->size() *
@@ -1676,7 +1677,8 @@ workspace_result_t<void> publication_indexes_t::build_impl(
             if (alias_edges && previous) {
                 output->edge_order_verified_ = previous->edge_order_verified_;
                 output->edge_source_ordinals_ = previous->edge_source_ordinals_;
-                output->aliased_domains_ |= detail::alias_domain_edges;
+                output->aliased_domains_.fetch_or(
+                    detail::alias_domain_edges, std::memory_order_relaxed);
                 output->bytes_.fetch_add(
                     previous->edge_source_ordinals_
                         ? previous->edge_source_ordinals_->size() * sizeof(std::uint32_t)
@@ -1730,7 +1732,8 @@ workspace_result_t<void> publication_indexes_t::build_impl(
             if (alias_symbols && previous) {
                 output->symbol_order_verified_ = previous->symbol_order_verified_;
                 output->symbol_ordinals_ = previous->symbol_ordinals_;
-                output->aliased_domains_ |= detail::alias_domain_symbols;
+                output->aliased_domains_.fetch_or(
+                    detail::alias_domain_symbols, std::memory_order_relaxed);
                 output->bytes_.fetch_add(
                     previous->symbol_ordinals_
                         ? previous->symbol_ordinals_->size() * sizeof(std::uint32_t)
@@ -1767,10 +1770,8 @@ workspace_result_t<void> publication_indexes_t::build_impl(
     if (cancel.stop_requested())
         return workspace_result_t<void>::failure(build_cancel_error(cancel, phase));
     if (previous && alias_xrefs && alias_functions && alias_symbols) {
-        bool call_graph_same = hints.call_graph_unchanged;
-        if (!call_graph_same)
-            call_graph_same = call_graph_content_equal(previous->snapshot_->call_graph,
-                snapshot.call_graph);
+        const bool call_graph_same =
+            call_graph_content_equal(previous->snapshot_->call_graph, snapshot.call_graph);
         if (call_graph_same) {
             std::shared_lock<std::shared_mutex> read(previous->call_graph_mutex_);
             if (previous->call_graph_memo_) {
@@ -1781,7 +1782,8 @@ workspace_result_t<void> publication_indexes_t::build_impl(
                     std::memory_order_relaxed);
                 output->accounted_bytes_.fetch_add(previous->call_graph_memo_bytes_,
                     std::memory_order_relaxed);
-                output->aliased_domains_ |= detail::alias_domain_call_graph;
+                output->aliased_domains_.fetch_or(
+                    detail::alias_domain_call_graph, std::memory_order_relaxed);
             }
         }
     }
@@ -1792,7 +1794,7 @@ workspace_result_t<void> publication_indexes_t::build_impl(
         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
             build_end - build_begin).count()),
         static_cast<unsigned long long>(output->bytes_.load(std::memory_order_relaxed)),
-        output->aliased_domains_,
+        output->aliased_domains_.load(std::memory_order_relaxed),
         output->source_order_verified_ ? 1 : 0, output->functions_verified_ ? 1 : 0,
         output->edge_order_verified_ ? 1 : 0, output->symbol_order_verified_ ? 1 : 0,
         static_cast<unsigned long>(GetCurrentThreadId()));
@@ -2911,6 +2913,56 @@ bool differential_selftest(std::string& detail) {
                     detail, "churn gen4 hint alias mask=" +
                     std::to_string(fourth->aliased_domains()));
             }
+            auto smaller_snapshot = std::make_shared<analysis_snapshot_t>(*gen4_snapshot);
+            smaller_snapshot->generation = 11;
+            smaller_snapshot->xrefs.resize(smaller_snapshot->xrefs.size() / 2);
+            smaller_snapshot->functions.resize(smaller_snapshot->functions.size() / 2);
+            smaller_snapshot->edges.resize(smaller_snapshot->edges.size() / 2);
+            smaller_snapshot->symbols.resize(smaller_snapshot->symbols.size() / 2);
+            auto smaller = std::make_shared<analysis_publication_t>(smaller_snapshot,
+                nullptr, nullptr, workspace_readiness_t::baseline_ready);
+            prebuild(smaller, all_hints);
+            auto fifth = for_publication(smaller, {});
+            pass &= expect(fifth != nullptr, detail, "churn gen5 stale hint build");
+            if (fifth) {
+                const std::uint32_t structural = detail::alias_domain_xrefs |
+                    detail::alias_domain_functions | detail::alias_domain_edges |
+                    detail::alias_domain_symbols;
+                pass &= expect((fifth->aliased_domains() & structural) == 0, detail,
+                    "churn gen5 stale cardinality hint rejected mask=" +
+                    std::to_string(fifth->aliased_domains()));
+                pass &= run_differential(corpus_t{smaller_snapshot, smaller}, *fifth,
+                    detail, "churn_gen5_stale_hint");
+            }
+            auto changed_snapshot =
+                std::make_shared<analysis_snapshot_t>(*smaller_snapshot);
+            changed_snapshot->generation = 12;
+            if (!changed_snapshot->xrefs.empty())
+                changed_snapshot->xrefs.front().confidence ^= 1;
+            if (!changed_snapshot->functions.empty())
+                changed_snapshot->functions.front().thunk =
+                    !changed_snapshot->functions.front().thunk;
+            if (!changed_snapshot->edges.empty())
+                changed_snapshot->edges.front().confidence ^= 1;
+            if (!changed_snapshot->symbols.empty())
+                changed_snapshot->symbols.front().name += "_changed";
+            auto changed = std::make_shared<analysis_publication_t>(changed_snapshot,
+                nullptr, nullptr, workspace_readiness_t::baseline_ready);
+            prebuild(changed, all_hints);
+            auto sixth = for_publication(changed, {});
+            pass &= expect(sixth != nullptr, detail, "churn gen6 stale hint build");
+            if (sixth) {
+                const std::uint32_t structural = detail::alias_domain_xrefs |
+                    detail::alias_domain_functions | detail::alias_domain_edges |
+                    detail::alias_domain_symbols;
+                pass &= expect((sixth->aliased_domains() & structural) == 0, detail,
+                    "churn gen6 stale content hint rejected mask=" +
+                    std::to_string(sixth->aliased_domains()));
+                pass &= run_differential(corpus_t{changed_snapshot, changed}, *sixth,
+                    detail, "churn_gen6_stale_hint");
+            }
+            cache_forget(changed_snapshot.get());
+            cache_forget(smaller_snapshot.get());
             cache_forget(gen4_snapshot.get());
             cache_forget(gen3_snapshot.get());
             cache_forget(gen2_snapshot.get());

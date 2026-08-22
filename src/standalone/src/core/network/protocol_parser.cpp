@@ -21,6 +21,12 @@
 
 namespace protocol_parser {
 
+namespace {
+constexpr size_t kMaxDecompressedBodyBytes = 64u * 1024u * 1024u;
+constexpr size_t kMaxHpackStringBytes = 1u * 1024u * 1024u;
+constexpr size_t kMaxHpackFields = 65536;
+}
+
 
 static std::string to_lower(const std::string& s) {
     std::string r = s;
@@ -665,6 +671,8 @@ std::vector<uint8_t> decompress_body(const std::vector<uint8_t>& body, const std
             diag::log_tagged("proto", "decompress_body empty body returning as-is");
             return body;
         }
+        if (body.size() > static_cast<size_t>((std::numeric_limits<uInt>::max)()))
+            return body;
 
         z_stream strm = {};
         strm.next_in = const_cast<Bytef*>(body.data());
@@ -678,7 +686,8 @@ std::vector<uint8_t> decompress_body(const std::vector<uint8_t>& body, const std
         }
 
         std::vector<uint8_t> result;
-        result.reserve(body.size() * 4);
+        result.reserve(body.size() > kMaxDecompressedBodyBytes / 4
+            ? kMaxDecompressedBodyBytes : body.size() * 4);
 
         uint8_t out_buf[16384];
         int ret;
@@ -686,12 +695,21 @@ std::vector<uint8_t> decompress_body(const std::vector<uint8_t>& body, const std
             strm.next_out = out_buf;
             strm.avail_out = sizeof(out_buf);
             ret = inflate(&strm, Z_NO_FLUSH);
-            if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
+            if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR || ret == Z_BUF_ERROR) {
                 diag::log_tagged_fmt("proto", "decompress_body inflate error ret=%d", ret);
                 inflateEnd(&strm);
                 return body;
             }
             size_t have = sizeof(out_buf) - strm.avail_out;
+            if (ret != Z_STREAM_END && have == 0) {
+                inflateEnd(&strm);
+                return body;
+            }
+            if (have > kMaxDecompressedBodyBytes - result.size()) {
+                diag::log_tagged_fmt("proto", "decompress_body output_limit input=%zu limit=%zu", body.size(), kMaxDecompressedBodyBytes);
+                inflateEnd(&strm);
+                return body;
+            }
             result.insert(result.end(), out_buf, out_buf + have);
         } while (ret != Z_STREAM_END);
 
@@ -702,9 +720,9 @@ std::vector<uint8_t> decompress_body(const std::vector<uint8_t>& body, const std
 
     if (enc == "br") {
         diag::log_tagged_fmt("proto", "decompress_body brotli branch input=%zu", body.size());
-        size_t decoded_size = body.size() * 4;
         std::vector<uint8_t> result;
-        result.resize(decoded_size);
+        result.reserve(body.size() > kMaxDecompressedBodyBytes / 4
+            ? kMaxDecompressedBodyBytes : body.size() * 4);
 
         BrotliDecoderState* bs = BrotliDecoderCreateInstance(nullptr, nullptr, nullptr);
         if (!bs) {
@@ -714,25 +732,34 @@ std::vector<uint8_t> decompress_body(const std::vector<uint8_t>& body, const std
 
         const uint8_t* next_in = body.data();
         size_t avail_in = body.size();
-        uint8_t* next_out = result.data();
-        size_t avail_out = decoded_size;
+        uint8_t out_buf[16384];
         size_t total_out = 0;
 
         BrotliDecoderResult br_res = BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT;
-        while (br_res == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT) {
-            br_res = BrotliDecoderDecompressStream(bs, &avail_in, &next_in, &avail_out, &next_out, &total_out);
-            if (br_res == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT) {
-                size_t off = next_out - result.data();
-                result.resize(result.size() * 2);
-                next_out = result.data() + off;
-                avail_out = result.size() - off;
+        while (br_res == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT ||
+               br_res == BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT) {
+            size_t avail_out = sizeof(out_buf);
+            uint8_t* next_out = out_buf;
+            const size_t before = total_out;
+            const size_t input_before = avail_in;
+            br_res = BrotliDecoderDecompressStream(bs, &avail_in, &next_in,
+                &avail_out, &next_out, &total_out);
+            const size_t produced = total_out - before;
+            if (produced > kMaxDecompressedBodyBytes - result.size()) {
+                diag::log_tagged_fmt("proto", "decompress_body brotli_output_limit input=%zu limit=%zu", body.size(), kMaxDecompressedBodyBytes);
+                BrotliDecoderDestroyInstance(bs);
+                return body;
+            }
+            result.insert(result.end(), out_buf, out_buf + produced);
+            if (br_res == BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT && input_before == avail_in) {
+                BrotliDecoderDestroyInstance(bs);
+                return body;
             }
         }
 
         BrotliDecoderDestroyInstance(bs);
 
         if (br_res == BROTLI_DECODER_RESULT_SUCCESS) {
-            result.resize(total_out);
             diag::log_tagged_fmt("proto", "decompress_body brotli success input=%zu output=%zu", body.size(), total_out);
             return result;
         }
@@ -836,6 +863,7 @@ static bool validate_h2_frame(uint8_t type, uint32_t length, uint8_t flags,
 std::vector<h2_frame> parse_h2_frames(const uint8_t* data, size_t len) {
     diag::log_tagged_fmt("proto", "parse_h2_frames entry len=%zu", len);
     std::vector<h2_frame> frames;
+    if (!data || len == 0) return frames;
 
     static const char h2_preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     size_t preface_len = 24;
@@ -846,7 +874,7 @@ std::vector<h2_frame> parse_h2_frames(const uint8_t* data, size_t len) {
         diag::log_tagged("proto", "parse_h2_frames detected connection preface");
     }
 
-    while (offset + 9 <= len) {
+    while (len - offset >= 9) {
         h2_frame f;
         f.length = read_u24(data + offset);
         f.type = static_cast<h2_frame_type>(data[offset + 3]);
@@ -858,7 +886,7 @@ std::vector<h2_frame> parse_h2_frames(const uint8_t* data, size_t len) {
             diag::log_tagged_fmt("proto", "parse_h2_frames frame too large length=%u breaking", f.length);
             break;
         }
-        if (offset + f.length > len) {
+        if (f.length > len - offset) {
             diag::log_tagged_fmt("proto", "parse_h2_frames frame truncated need=%u have=%zu", f.length, len - offset);
             break;
         }
@@ -960,35 +988,48 @@ static const h2_header_field hpack_static_table[] = {
 };
 static const size_t HPACK_STATIC_TABLE_SIZE = sizeof(hpack_static_table) / sizeof(hpack_static_table[0]);
 
-static uint32_t hpack_decode_integer(const uint8_t* data, size_t len, size_t& pos, uint8_t prefix_bits) {
-    if (pos >= len) return 0;
+static bool hpack_decode_integer(const uint8_t* data, size_t len, size_t& pos,
+                                 uint8_t prefix_bits, uint32_t& out) {
+    if (!data || pos >= len || prefix_bits == 0 || prefix_bits > 8) return false;
     uint32_t max_first = (1u << prefix_bits) - 1;
     uint32_t value = data[pos] & max_first;
     pos++;
-    if (value < max_first) return value;
+    if (value < max_first) {
+        out = value;
+        return true;
+    }
 
     uint32_t m = 0;
+    bool terminated = false;
     while (pos < len) {
         uint8_t b = data[pos];
         pos++;
+        if (m >= 32 || (static_cast<uint32_t>(b & 0x7F) >
+            ((std::numeric_limits<uint32_t>::max)() - value) >> m)) return false;
         value += static_cast<uint32_t>(b & 0x7F) << m;
+        if ((b & 0x80) == 0) {
+            terminated = true;
+            break;
+        }
         m += 7;
-        if ((b & 0x80) == 0) break;
-        if (m > 28) break;
+        if (m > 28) return false;
     }
-    return value;
+    if (!terminated) return false;
+    out = value;
+    return true;
 }
 
-static std::string hpack_decode_string(const uint8_t* data, size_t len, size_t& pos) {
-    if (pos >= len) return {};
+static bool hpack_decode_string(const uint8_t* data, size_t len, size_t& pos, std::string& out) {
+    if (!data || pos >= len) return false;
     bool huffman = (data[pos] & 0x80) != 0;
-    uint32_t slen = hpack_decode_integer(data, len, pos, 7);
-    if (pos + slen > len) { pos = len; return {}; }
+    uint32_t slen = 0;
+    if (!hpack_decode_integer(data, len, pos, 7, slen) || slen > len - pos) return false;
 
+    if (slen > kMaxHpackStringBytes) return false;
     if (!huffman) {
-        std::string s(reinterpret_cast<const char*>(data + pos), slen);
+        out.assign(reinterpret_cast<const char*>(data + pos), slen);
         pos += slen;
-        return s;
+        return true;
     }
 
 
@@ -1092,7 +1133,8 @@ static std::string hpack_decode_string(const uint8_t* data, size_t len, size_t& 
     }
 
     pos += slen;
-    return result;
+    out = std::move(result);
+    return true;
 }
 
 static h2_header_field hpack_get_indexed(size_t index, const hpack_context& ctx) {
@@ -1108,7 +1150,14 @@ static h2_header_field hpack_get_indexed(size_t index, const hpack_context& ctx)
 }
 
 static void hpack_add_to_dynamic(hpack_context& ctx, const h2_header_field& field) {
+    if (field.name.size() > (std::numeric_limits<size_t>::max)() - field.value.size() - 32)
+        return;
     size_t entry_size = field.name.size() + field.value.size() + 32;
+    if (entry_size > ctx.max_dynamic_table_size) {
+        ctx.dynamic_table.clear();
+        ctx.dynamic_table_size = 0;
+        return;
+    }
     ctx.dynamic_table.insert(ctx.dynamic_table.begin(), field);
     ctx.dynamic_table_size += entry_size;
 
@@ -1122,23 +1171,27 @@ static void hpack_add_to_dynamic(hpack_context& ctx, const h2_header_field& fiel
 h2_parsed_headers decode_hpack(const uint8_t* data, size_t len, hpack_context& ctx) {
     diag::log_tagged_fmt("proto", "decode_hpack entry len=%zu dyn_table_size=%zu", len, ctx.dynamic_table.size());
     h2_parsed_headers result;
+    if (!data || len > 16u * 1024u * 1024u || ctx.max_dynamic_table_size > 16u * 1024u * 1024u) return result;
     size_t pos = 0;
 
     while (pos < len) {
         uint8_t b = data[pos];
 
         if (b & 0x80) {
-            uint32_t index = hpack_decode_integer(data, len, pos, 7);
+            uint32_t index = 0;
+            if (!hpack_decode_integer(data, len, pos, 7, index)) return result;
             auto field = hpack_get_indexed(index, ctx);
             if (field.name.empty()) {
                 result.valid = false;
                 return result;
             }
             diag::log_tagged_fmt("proto", "decode_hpack indexed idx=%u name=%s value=%s", index, field.name.c_str(), field.value.c_str());
+            if (result.fields.size() >= kMaxHpackFields) { result.valid = false; return result; }
             result.fields.push_back(field);
         }
         else if (b & 0x40) {
-            uint32_t index = hpack_decode_integer(data, len, pos, 6);
+            uint32_t index = 0;
+            if (!hpack_decode_integer(data, len, pos, 6, index)) return result;
             h2_header_field field;
             if (index > 0) {
                 field = hpack_get_indexed(index, ctx);
@@ -1146,10 +1199,10 @@ h2_parsed_headers decode_hpack(const uint8_t* data, size_t len, hpack_context& c
                     result.valid = false;
                     return result;
                 }
-                field.value = hpack_decode_string(data, len, pos);
+                if (!hpack_decode_string(data, len, pos, field.value)) return result;
             } else {
-                field.name = hpack_decode_string(data, len, pos);
-                field.value = hpack_decode_string(data, len, pos);
+                if (!hpack_decode_string(data, len, pos, field.name) ||
+                    !hpack_decode_string(data, len, pos, field.value)) return result;
             }
             if (field.name.empty()) {
                 result.valid = false;
@@ -1157,10 +1210,12 @@ h2_parsed_headers decode_hpack(const uint8_t* data, size_t len, hpack_context& c
             }
             diag::log_tagged_fmt("proto", "decode_hpack literal-with-index name=%s value=%s", field.name.c_str(), field.value.c_str());
             hpack_add_to_dynamic(ctx, field);
+            if (result.fields.size() >= kMaxHpackFields) { result.valid = false; return result; }
             result.fields.push_back(field);
         }
         else if (b & 0x20) {
-            uint32_t new_size = hpack_decode_integer(data, len, pos, 5);
+            uint32_t new_size = 0;
+            if (!hpack_decode_integer(data, len, pos, 5, new_size) || new_size > 16u * 1024u * 1024u) return result;
             diag::log_tagged_fmt("proto", "decode_hpack dynamic table size update new_size=%u", new_size);
             ctx.max_dynamic_table_size = new_size;
             while (ctx.dynamic_table_size > ctx.max_dynamic_table_size && !ctx.dynamic_table.empty()) {
@@ -1172,7 +1227,8 @@ h2_parsed_headers decode_hpack(const uint8_t* data, size_t len, hpack_context& c
         else {
             bool never_index = (b & 0x10) != 0;
             (void)never_index;
-            uint32_t index = hpack_decode_integer(data, len, pos, 4);
+            uint32_t index = 0;
+            if (!hpack_decode_integer(data, len, pos, 4, index)) return result;
             h2_header_field field;
             if (index > 0) {
                 field = hpack_get_indexed(index, ctx);
@@ -1180,16 +1236,17 @@ h2_parsed_headers decode_hpack(const uint8_t* data, size_t len, hpack_context& c
                     result.valid = false;
                     return result;
                 }
-                field.value = hpack_decode_string(data, len, pos);
+                if (!hpack_decode_string(data, len, pos, field.value)) return result;
             } else {
-                field.name = hpack_decode_string(data, len, pos);
-                field.value = hpack_decode_string(data, len, pos);
+                if (!hpack_decode_string(data, len, pos, field.name) ||
+                    !hpack_decode_string(data, len, pos, field.value)) return result;
             }
             if (field.name.empty()) {
                 result.valid = false;
                 return result;
             }
             diag::log_tagged_fmt("proto", "decode_hpack literal-never-index=%d name=%s value=%s", (int)never_index, field.name.c_str(), field.value.c_str());
+            if (result.fields.size() >= kMaxHpackFields) { result.valid = false; return result; }
             result.fields.push_back(field);
         }
     }
@@ -1274,7 +1331,7 @@ ws_frame parse_ws_frame(const uint8_t* data, size_t len) {
     }
 
     f.payload_length = plen;
-    if (hdr_size + plen > len) {
+    if (plen > len - hdr_size || plen > static_cast<uint64_t>((std::numeric_limits<size_t>::max)() - hdr_size)) {
         diag::log_tagged_fmt("proto", "parse_ws_frame truncated hdr=%zu plen=%llu total_avail=%zu", hdr_size, (unsigned long long)plen, len);
         return f;
     }

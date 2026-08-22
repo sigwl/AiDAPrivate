@@ -37,6 +37,7 @@ struct launch_options_t {
 
 struct launch_result_t {
 	bool        ok = false;
+	uint32_t    win32_error = 0;
 	uint32_t    pid = 0;
 	uint32_t    thread_id = 0;
 	uintptr_t   process_handle = 0;
@@ -44,11 +45,13 @@ struct launch_result_t {
 	uintptr_t   job_handle = 0;
 	std::string firewall_rule_name;
 	std::wstring sandbox_dir;
+	std::wstring appcontainer_profile_name;
 	bool        sandbox_pid_registered = false;
 	bool        net_logger_registered = false;
 	bool        token_restricted = false;
 	bool        integrity_lowered = false;
 	bool        mitigations_applied = false;
+	bool        windows_sandbox_host_owned = false;
 	std::string error;
 };
 

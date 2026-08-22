@@ -544,6 +544,7 @@ bool voyager::device_t::connect() noexcept {
     }
 
     if (!is_connected()) {
+        driver_handle_ = INVALID_HANDLE_VALUE;
         last_connect_error_ = last_error != ERROR_SUCCESS ? last_error : first_error;
         if (last_connect_error_ == ERROR_SUCCESS) {
             last_connect_error_ = ERROR_NO_SUCH_DEVICE;
@@ -567,7 +568,7 @@ bool voyager::device_t::connect() noexcept {
     return true;
 }
 void voyager::device_t::disconnect() noexcept {
-    clear_process_context();
+    const bool context_cleared = clear_process_context();
 
     if (is_connected()) {
         CloseHandle(driver_handle_);
@@ -575,9 +576,11 @@ void voyager::device_t::disconnect() noexcept {
     }
 
     kernel_dtb_ = 0;
+    if (!context_cleared)
+        SetLastError(ERROR_BUSY);
 }
 
-void voyager::device_t::set_process_id(std::uint32_t pid) noexcept {
+bool voyager::device_t::set_process_id(std::uint32_t pid) noexcept {
     const std::uint32_t prev_pid = process_id_;
     const std::uint64_t prev_shellcode = shellcode_address_;
     const std::uint64_t prev_spoof_gadget = spoof_gadget_;
@@ -589,6 +592,7 @@ void voyager::device_t::set_process_id(std::uint32_t pid) noexcept {
     const bool connected = is_connected();
     const bool pid_changing = (prev_pid != 0 && prev_pid != pid);
     int shellcode_freed = 0;
+    int shellcode_free_failed = 0;
     int shellcode_free_skipped_disconnected = 0;
     int shellcode_free_skipped_no_address = 0;
 
@@ -608,13 +612,21 @@ void voyager::device_t::set_process_id(std::uint32_t pid) noexcept {
     if (pid_changing) {
         if (prev_shellcode != 0) {
             if (connected && prev_pid_alive) {
-                free_memory(prev_shellcode);
-                shellcode_freed = 1;
+                if (free_memory(prev_shellcode)) {
+                    shellcode_freed = 1;
+                } else {
+                    shellcode_free_failed = 1;
+                }
             } else {
                 shellcode_free_skipped_disconnected = 1;
+                shellcode_free_failed = 1;
             }
         } else {
             shellcode_free_skipped_no_address = 1;
+        }
+        if (shellcode_free_failed) {
+            SetLastError(GetLastError() == ERROR_SUCCESS ? ERROR_BUSY : GetLastError());
+            return false;
         }
         shellcode_address_ = 0;
         shellcode_pid_ = 0;
@@ -627,10 +639,18 @@ void voyager::device_t::set_process_id(std::uint32_t pid) noexcept {
         last_hijacked_tid_ = 0;
     } else if (prev_pid != pid && shellcode_address_ != 0) {
         if (connected) {
-            free_memory(shellcode_address_);
-            shellcode_freed = 1;
+            if (free_memory(shellcode_address_)) {
+                shellcode_freed = 1;
+            } else {
+                shellcode_free_failed = 1;
+            }
         } else {
             shellcode_free_skipped_disconnected = 1;
+            shellcode_free_failed = 1;
+        }
+        if (shellcode_free_failed) {
+            SetLastError(GetLastError() == ERROR_SUCCESS ? ERROR_BUSY : GetLastError());
+            return false;
         }
         shellcode_address_ = 0;
         shellcode_pid_ = 0;
@@ -683,11 +703,14 @@ void voyager::device_t::set_process_id(std::uint32_t pid) noexcept {
                 reinterpret_cast<unsigned long long>(driver_handle_));
         }
     }
+    return true;
 }
 
-void voyager::device_t::clear_process_context() noexcept {
-    if (is_connected() && shellcode_address_ != 0 && process_id_ != 0) {
-        free_memory(shellcode_address_);
+bool voyager::device_t::clear_process_context() noexcept {
+    if (shellcode_address_ != 0) {
+        if (!is_connected() || !free_memory(shellcode_address_)) {
+            return false;
+        }
     }
 
     shellcode_address_ = 0;
@@ -698,6 +721,9 @@ void voyager::device_t::clear_process_context() noexcept {
     dtb_ = 0;
     spoof_gadget_ = 0;
     last_failed_tid_ = 0;
+    last_hijacked_tid_ = 0;
+    kernel_dtb_ = 0;
+    return true;
 }
 
 std::uint32_t voyager::device_t::find_process(const char* process_name) noexcept {
@@ -741,18 +767,9 @@ std::uint32_t voyager::device_t::find_process(const char* process_name) noexcept
     CloseHandle(snapshot);
 
     if (found_pid != 0) {
-        if (shellcode_address_ != 0 && process_id_ != 0 && process_id_ != found_pid) {
-            free_memory(shellcode_address_);
-            shellcode_address_ = 0;
+        if (process_id_ != found_pid && !set_process_id(found_pid)) {
+            return 0;
         }
-        if (process_id_ != found_pid) {
-            shellcode_pid_ = 0;
-            shellcode_dtb_at_alloc_ = 0;
-        }
-        process_id_ = found_pid;
-        dtb_ = 0;
-        base_address_ = 0;
-        spoof_gadget_ = 0;
     }
 
     return found_pid;
@@ -902,7 +919,9 @@ std::size_t voyager::device_t::transfer_physical_read(
     std::uint64_t address,
     void* buffer,
     std::size_t size) const noexcept {
-    if (!buffer || size == 0 || !is_connected() || dtb == 0) {
+    if (!buffer || size == 0 || !is_connected() || dtb == 0 ||
+        size - 1 > UINT64_MAX - address ||
+        size - 1 > UINTPTR_MAX - reinterpret_cast<std::uintptr_t>(buffer)) {
         diag::log_tagged_fmt("comm",
             "phys_transfer_read_reject pid=%u attached_pid=%u tid=%lu va=0x%llX size=%zu dtb=0x%llX buffer=%p connected=%d reason=invalid_args gle=%lu",
             pid,
@@ -1032,7 +1051,9 @@ std::size_t voyager::device_t::transfer_physical_write(
     std::uint64_t address,
     const void* buffer,
     std::size_t size) const noexcept {
-    if (!buffer || size == 0 || !is_connected() || dtb == 0) {
+    if (!buffer || size == 0 || !is_connected() || dtb == 0 ||
+        size - 1 > UINT64_MAX - address ||
+        size - 1 > UINTPTR_MAX - reinterpret_cast<std::uintptr_t>(buffer)) {
         diag::log_tagged_fmt("comm",
             "phys_transfer_write_reject pid=%u attached_pid=%u tid=%lu va=0x%llX size=%zu dtb=0x%llX buffer=%p connected=%d reason=invalid_args gle=%lu",
             pid,
@@ -1282,8 +1303,11 @@ bool voyager::device_t::ensure_shellcode_allocated() noexcept {
     const std::uint64_t prev_shellcode_dtb = shellcode_dtb_at_alloc_;
     const bool needs_realloc = shellcode_address_ != 0;
 
-    if (shellcode_address_ != 0 && is_connected()) {
-        free_memory(shellcode_address_);
+    if (shellcode_address_ != 0) {
+        if (!is_connected() || !free_memory(shellcode_address_)) {
+            SetLastError(GetLastError() == ERROR_SUCCESS ? ERROR_BUSY : GetLastError());
+            return false;
+        }
     }
     shellcode_address_ = 0;
     shellcode_pid_ = 0;

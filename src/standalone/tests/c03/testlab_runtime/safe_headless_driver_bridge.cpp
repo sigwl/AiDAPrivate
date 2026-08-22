@@ -617,7 +617,7 @@ bool device_t::connect() noexcept
     return false;
 }
 
-void device_t::clear_process_context() noexcept
+bool device_t::clear_process_context() noexcept
 {
     process_id_ = 0;
     base_address_ = 0;
@@ -626,6 +626,7 @@ void device_t::clear_process_context() noexcept
     spoof_gadget_ = 0;
     shellcode_pid_ = 0;
     shellcode_dtb_at_alloc_ = 0;
+    return true;
 }
 
 std::uint64_t device_t::find_image() noexcept
@@ -842,9 +843,9 @@ bool device_t::stream_reassemble_op(std::uint32_t, std::uint32_t, std::uint32_t,
     return false;
 }
 
-void device_t::set_process_id(std::uint32_t) noexcept
+bool device_t::set_process_id(std::uint32_t) noexcept
 {
-    clear_process_context();
+    return clear_process_context();
 }
 
 void device_t::disconnect() noexcept

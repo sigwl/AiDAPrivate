@@ -190,7 +190,7 @@ namespace dispatcher {
 
         if (code == ioctl_codes::PRW()) {
             if (input_size >= sizeof(_PRW) && output_size >= sizeof(_PRW)) {
-                status = functions::handle777e((p_physical_rw)buffer);
+                status = functions::handle777e((p_physical_rw)buffer, irp->RequestorMode);
                 bytes = sizeof(_PRW);
             }
             else {

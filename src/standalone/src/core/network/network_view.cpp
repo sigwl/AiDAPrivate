@@ -1935,7 +1935,7 @@ void shutdown() {
 
     aida::burp::shutdown();
 
-    mitm_proxy::stop();
+    mitm_proxy::shutdown();
     ssl_keylog::stop_watching();
     g_state.active = false;
     diag::log_tagged("network", "shutdown_complete");

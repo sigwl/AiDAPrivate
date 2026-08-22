@@ -471,6 +471,7 @@ inline void take_snapshot(const std::string& name = "")
 	g_state.progress.store(0.f);
 	const std::uint64_t operation_generation =
 		g_state.operation_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+	const std::uint32_t target_pid = driver_bridge::attached_pid();
 
 	std::string snap_name = name;
 	if (snap_name.empty()) {
@@ -489,18 +490,18 @@ inline void take_snapshot(const std::string& name = "")
 	sub.thread_class = "scanner_snapshot";
 	sub.domain = aida::infra::executor::domain_t::long_running;
 	sub.priority = 2;
-	sub.target_pid = driver_bridge::attached_pid();
+	sub.target_pid = target_pid;
 	sub.generation = operation_generation;
-	sub.body = [snap_name, operation_generation]() {
+	sub.body = [snap_name, operation_generation, target_pid]() {
 		auto t_start = std::chrono::steady_clock::now();
 		snapshot_t snap;
 		snap.id = g_state.next_snap_id.fetch_add(1);
 		snap.name = snap_name;
-		snap.pid = driver_bridge::attached_pid();
+		snap.pid = target_pid;
 		snap.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
 			std::chrono::system_clock::now().time_since_epoch()).count();
 
-		auto regions = driver_bridge::enumerate_memory_regions(4096);
+		auto regions = driver_bridge::enumerate_memory_regions_for(target_pid, 4096);
 
 		std::vector<driver_bridge::memory_region_t> readable;
 		for (auto& r : regions) {
@@ -533,8 +534,30 @@ inline void take_snapshot(const std::string& name = "")
 				detail::maximum_region_bytes, remaining});
 			bounded = bounded || requested < r.size;
 
-			if (requested > 0 && driver_bridge::read_memory(r.base,
-				static_cast<std::size_t>(requested), sr.data) && !sr.data.empty()) {
+			const bool read_ok = requested > 0 &&
+				driver_bridge::read_memory_for(target_pid, r.base,
+					static_cast<std::size_t>(requested), sr.data);
+			if (!read_ok || sr.data.size() != static_cast<std::size_t>(requested)) {
+				const std::size_t returned = sr.data.size();
+				const std::uint64_t unreadable = r.base + static_cast<std::uint64_t>(returned);
+				std::lock_guard<std::mutex> lock(g_state.mutex);
+				char address_text[32]{};
+				std::snprintf(address_text, sizeof(address_text), "0x%016llX",
+					static_cast<unsigned long long>(unreadable));
+				g_state.last_error = "snapshot read failed at " + std::string(address_text) +
+					" unreadable=" + std::to_string(requested - returned) +
+					" requested=" + std::to_string(requested) +
+					" returned=" + std::to_string(returned);
+				diag::log_tagged_fmt("snapshot_diff",
+					"take_snapshot read_failed pid=%u first_unreadable=0x%llX unreadable=%llu requested=%llu returned=%zu",
+					target_pid, static_cast<unsigned long long>(unreadable),
+					static_cast<unsigned long long>(requested - returned),
+					static_cast<unsigned long long>(requested), returned);
+				g_state.capturing.store(false, std::memory_order_release);
+				g_state.progress.store(1.f, std::memory_order_release);
+				return;
+			}
+			if (read_ok) {
 				sr.size = sr.data.size();
 				snap.total_bytes += sr.data.size();
 				snap.regions.push_back(std::move(sr));
@@ -544,6 +567,7 @@ inline void take_snapshot(const std::string& name = "")
 			g_state.progress.store(static_cast<float>(done) / static_cast<float>(total));
 		}
 		if (g_state.cancel.load(std::memory_order_acquire) ||
+			driver_bridge::attached_pid() != target_pid ||
 			g_state.operation_generation.load(std::memory_order_acquire) != operation_generation) {
 			g_state.progress.store(1.f);
 			g_state.capturing.store(false);

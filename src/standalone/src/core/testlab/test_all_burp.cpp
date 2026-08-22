@@ -5664,7 +5664,7 @@ namespace {
         char step_label[256];
         _snprintf_s(step_label, sizeof(step_label), _TRUNCATE, "burp test: %s", name);
         set_progress_step(step_label);
-        static test_lab::bounded_runner_t runner(4);
+        static test_lab::bounded_runner_t runner(1);
         auto state = std::make_shared<burp_worker_state_t>();
         auto worker_log = std::make_shared<burp_log_handle_t>(duplicate_burp_log_handle(hf));
         const uint64_t t0 = GetTickCount64();

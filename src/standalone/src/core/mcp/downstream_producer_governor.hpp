@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstddef>
+#include <cctype>
 #include <cstdio>
 #include <functional>
 #include <map>
@@ -265,6 +266,7 @@ public:
     const producer_quota_set_t& quotas() const { return quotas_; }
 
     void request_shutdown() { shutdown_requested_.store(true, std::memory_order_release); }
+    void clear_shutdown() { shutdown_requested_.store(false, std::memory_order_release); }
     bool shutdown_requested() const { return shutdown_requested_.load(std::memory_order_acquire); }
 
     admission_result_t try_admit(const producer_identity_t& identity)

@@ -1514,7 +1514,7 @@ inline ghidra_result_t decompile_function(uint64_t entry_addr,
 	}
 
 	const uint32_t attached_pid = driver_bridge::attached_pid();
-	auto modules = driver_bridge::enumerate_modules();
+	auto modules = attached_pid != 0 ? driver_bridge::enumerate_modules_for(attached_pid) : driver_bridge::enumerate_modules();
 	driver_bridge::module_info_t selected_module{};
 	bool module_found = false;
 	for (const auto& m : modules) {
@@ -1566,7 +1566,9 @@ inline ghidra_result_t decompile_function(uint64_t entry_addr,
 	}
 
 	driver_bridge::memory_region_t region{};
-	const bool region_ok = driver_bridge::query_memory(entry_addr, region);
+	const bool region_ok = attached_pid != 0
+		? driver_bridge::query_memory_for(attached_pid, entry_addr, region)
+		: driver_bridge::query_memory(entry_addr, region);
 	const bool region_executable = region_ok && decompile_protect_executable(region.protect);
 	const bool region_committed = region_ok && region.state == MEM_COMMIT;
 	if (!section_found && region_ok) {
@@ -1650,7 +1652,9 @@ inline ghidra_result_t decompile_function(uint64_t entry_addr,
 
 	std::vector<uint8_t> mem;
 	SetLastError(ERROR_SUCCESS);
-	const bool read_ok = driver_bridge::read_memory(read_base, read_size, mem);
+	const bool read_ok = attached_pid != 0
+		? driver_bridge::read_memory_for(attached_pid, read_base, read_size, mem)
+		: driver_bridge::read_memory(read_base, read_size, mem);
 	const DWORD read_gle = read_ok ? ERROR_SUCCESS : GetLastError();
 	if (mem.size() > read_size)
 		mem.resize(read_size);
@@ -1683,6 +1687,15 @@ inline ghidra_result_t decompile_function(uint64_t entry_addr,
 	if (!read_ok || mem.empty() || entry_offset >= mem.size()) {
 		result.is_error = true;
 		result.error_text = "failed to read executable bytes at target address";
+		return result;
+	}
+	if (attached_pid != 0 && driver_bridge::attached_pid() != attached_pid) {
+		result.is_error = true;
+		result.error_text = "attached target changed while executable bytes were read";
+		diag::log_tagged_fmt("ghidra",
+			"decompile_function_discard_stale addr=0x%llX expected_pid=%u active_pid=%u",
+			static_cast<unsigned long long>(entry_addr), attached_pid,
+			driver_bridge::attached_pid());
 		return result;
 	}
 	if (entry_window_zero) {
@@ -2761,7 +2774,10 @@ inline bool preload_module(uint64_t base, size_t size, std::vector<uint8_t>& out
 			static_cast<unsigned long long>(base), size);
 		return false;
 	}
-	profile.whole_read_ok = driver_bridge::read_memory(base, size, out);
+	const uint32_t pid = driver_bridge::attached_pid();
+	profile.whole_read_ok = pid != 0
+		? driver_bridge::read_memory_for(pid, base, size, out)
+		: driver_bridge::read_memory(base, size, out);
 	profile.first_attempt_bytes = out.size();
 	if (profile.whole_read_ok && !out.empty()) {
 		profile.whole_read_zero_padding = buffer_is_zero_padding(out);
@@ -2792,7 +2808,10 @@ inline bool preload_module(uint64_t base, size_t size, std::vector<uint8_t>& out
 		size_t chunk = (std::min)(static_cast<size_t>(0x10000), size - offset);
 
 		driver_bridge::memory_region_t region{};
-		if (driver_bridge::query_memory(addr, region)) {
+		const bool region_ok = pid != 0
+			? driver_bridge::query_memory_for(pid, addr, region)
+			: driver_bridge::query_memory(addr, region);
+		if (region_ok) {
 			++profile.query_ok;
 			const uint64_t region_end = region.base + region.size;
 			if (region.base <= addr && region_end > addr) {
@@ -2820,7 +2839,10 @@ inline bool preload_module(uint64_t base, size_t size, std::vector<uint8_t>& out
 		}
 
 		std::vector<uint8_t> chunk_data;
-		if (driver_bridge::read_memory(addr, chunk, chunk_data) && !chunk_data.empty()) {
+		const bool chunk_ok = pid != 0
+			? driver_bridge::read_memory_for(pid, addr, chunk, chunk_data)
+			: driver_bridge::read_memory(addr, chunk, chunk_data);
+		if (chunk_ok && !chunk_data.empty()) {
 			const size_t copied = (std::min)(chunk_data.size(), size - offset);
 			std::memcpy(out.data() + offset, chunk_data.data(), copied);
 			profile.total_read += copied;

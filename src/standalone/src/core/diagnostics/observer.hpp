@@ -24,7 +24,7 @@ namespace aida::diagnostics::observer {
 struct observer_config_t {
     std::uint32_t poll_interval_ms = 5000;
     std::uint32_t hung_threshold_ms = 5000;
-    std::uint32_t max_lifetime_ms = 600000;
+    std::uint32_t max_lifetime_ms = 0;
     std::uint32_t wm_null_timeout_ms = 200;
     bool enabled = true;
 };
@@ -41,6 +41,7 @@ struct observer_state_t {
     std::atomic<std::uint64_t> start_ms{0};
     std::mutex mtx;
     observer_config_t config;
+    aida::infra::win_thread::joinable_thread_t worker;
 };
 
 inline observer_state_t& state() {
@@ -227,7 +228,7 @@ inline void observer_loop(DWORD pid, HWND hwnd) {
 
     while (!s.stop_requested.load(std::memory_order_acquire)) {
         const std::uint64_t elapsed = now_ms() - s.start_ms.load(std::memory_order_acquire);
-        if (elapsed >= s.config.max_lifetime_ms) {
+        if (s.config.max_lifetime_ms != 0 && elapsed >= s.config.max_lifetime_ms) {
             diag::log_tagged_fmt("diag",
                 "OBSERVER-LIFETIME-EXCEEDED elapsed_ms=%llu max_lifetime_ms=%u",
                 static_cast<unsigned long long>(elapsed),
@@ -306,8 +307,11 @@ inline void observer_loop(DWORD pid, HWND hwnd) {
 
 inline bool start(DWORD pid, HWND hwnd, const observer_config_t& cfg = {}) {
     auto& s = state();
+    std::lock_guard<std::mutex> lock(s.mtx);
     if (s.running.load(std::memory_order_acquire))
         return true;
+    if (s.worker.joinable())
+        return false;
     if (!cfg.enabled)
         return false;
 
@@ -321,9 +325,8 @@ inline bool start(DWORD pid, HWND hwnd, const observer_config_t& cfg = {}) {
     s.hang_detected_count.store(0, std::memory_order_release);
     s.wer_correlation_count.store(0, std::memory_order_release);
 
-    aida::infra::win_thread::joinable_thread_t worker;
     std::string err;
-    const bool started = worker.start(
+    const bool started = s.worker.start(
         [pid, hwnd]() { observer_loop(pid, hwnd); },
         &err, aida::infra::win_thread::default_stack_reserve, "diag_observer");
 
@@ -337,13 +340,21 @@ inline bool start(DWORD pid, HWND hwnd, const observer_config_t& cfg = {}) {
         return false;
     }
 
-    worker.detach();
     return true;
 }
 
-inline void stop() {
+inline bool stop() {
     auto& s = state();
     s.stop_requested.store(true, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(s.mtx);
+    if (!s.worker.joinable())
+        return true;
+    s.worker.join();
+    diag::log_tagged_critical_fmt("diag",
+        "OBSERVER-STOP-WAIT joined=%d wait_mode=blocking running=%d",
+        1,
+        s.running.load(std::memory_order_acquire) ? 1 : 0);
+    return true;
 }
 
 inline bool is_running() {

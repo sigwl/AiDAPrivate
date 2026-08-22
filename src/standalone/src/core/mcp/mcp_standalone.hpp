@@ -7,6 +7,8 @@
 #include <cstddef>
 #include <map>
 #include <memory>
+#include <functional>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 #include <optional>
@@ -108,7 +110,7 @@ namespace mcp_standalone
         bool start(int port);
         void stop();
         bool is_running() const { return _running.load(); }
-        int  get_port() const { return _port; }
+        int  get_port() const { return _port.load(std::memory_order_acquire); }
         bool register_tool(tool_def_t tool);
         bool register_tool(
             tool_def_t tool,
@@ -130,6 +132,8 @@ namespace mcp_standalone
         const tool_registry_t& registry() const noexcept { return _registry; }
 
     private:
+        struct shared_state_t;
+        explicit server_t(std::shared_ptr<shared_state_t> state, bool owns_lifecycle);
         friend std::string handle_body(server_t*, const std::string&, const std::function<bool()>&);
         void server_thread_func(int port);
         json handle_initialize(const json& id, const json& params);
@@ -148,17 +152,19 @@ namespace mcp_standalone
         void clear_local_capability() noexcept;
         bool snapshot_local_capability(std::string& capability,
                                        std::string& run_binding) const;
-        tool_registry_t _registry;
-        std::atomic<bool> _server_done{true};
-        std::atomic<bool> _running{false};
-        std::atomic<bool> _stop_requested{false};
-        void* _active_server = nullptr;
-        std::mutex _server_mtx;
-        std::atomic<std::uint32_t> _server_worker_tid{0};
-        mutable std::mutex _local_capability_mtx;
-        std::string _local_capability;
-        std::string _local_run_binding;
-        int _port = 0;
+        std::shared_ptr<shared_state_t> _state;
+        bool _owns_lifecycle = true;
+        tool_registry_t& _registry;
+        std::atomic<bool>& _server_done;
+        std::atomic<bool>& _running;
+        std::atomic<bool>& _stop_requested;
+        void*& _active_server;
+        std::mutex& _server_mtx;
+        std::atomic<std::uint32_t>& _server_worker_tid;
+        std::mutex& _local_capability_mtx;
+        std::string& _local_capability;
+        std::string& _local_run_binding;
+        std::atomic<int>& _port;
     };
 
     void register_standalone_tools(server_t& server);

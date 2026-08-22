@@ -169,6 +169,10 @@ std::string local_appdata_dir()
 
 bool quote_path(const std::string& in, std::wstring& out)
 {
+    if (in.empty() || std::any_of(in.begin(), in.end(), [](unsigned char c) {
+        return c < 0x20 || c == 0x7f || c == '"';
+    }))
+        return false;
     std::wstring w = utf8_to_wide(in);
     if (w.empty()) return false;
     out.clear();
@@ -274,6 +278,8 @@ std::string profile_root()
     base += "\\AiDA";
     std::error_code ec;
     std::filesystem::create_directories(base, ec);
+    if (ec)
+        return std::string();
     diag::log_tagged_fmt("browser", "profile_root result=%s", base.c_str());
     return base;
 }
@@ -282,8 +288,25 @@ std::string compute_profile_path(const std::string& subdir)
 {
     std::string sd = subdir.empty() ? std::string("BurpBrowser") : subdir;
     diag::log_tagged_fmt("browser", "compute_profile_path entry subdir=%s", sd.c_str());
-    std::string base = profile_root();
-    base += "\\";
+    size_t component_start = 0;
+    while (component_start <= sd.size()) {
+        const size_t component_end = sd.find_first_of("/\\", component_start);
+        const std::string component = sd.substr(component_start,
+            component_end == std::string::npos ? std::string::npos : component_end - component_start);
+        if (component.empty() || component == "." || component == "..")
+            return std::string();
+        if (component_end == std::string::npos)
+            break;
+        component_start = component_end + 1;
+    }
+    const std::string root = profile_root();
+    if (root.empty()) return std::string();
+    std::error_code root_status_ec;
+    const auto root_status = std::filesystem::symlink_status(root, root_status_ec);
+    if (root_status_ec || std::filesystem::is_symlink(root_status) ||
+        !std::filesystem::is_directory(root_status))
+        return std::string();
+    std::string base = root + "\\";
     for (char c : sd) {
         if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' ||
             c == '<' || c == '>' || c == '|') {
@@ -294,6 +317,18 @@ std::string compute_profile_path(const std::string& subdir)
     }
     std::error_code ec;
     std::filesystem::create_directories(base, ec);
+    if (ec) return std::string();
+    const auto profile_status = std::filesystem::symlink_status(base, ec);
+    if (ec || std::filesystem::is_symlink(profile_status) ||
+        !std::filesystem::is_directory(profile_status))
+        return std::string();
+    const auto root_path = std::filesystem::weakly_canonical(std::filesystem::path(root), ec);
+    if (ec) return std::string();
+    const auto profile = std::filesystem::weakly_canonical(std::filesystem::path(base), ec);
+    if (ec) return std::string();
+    const auto relative = std::filesystem::relative(profile, root_path, ec);
+    if (ec || relative.empty() || relative == "." || relative.string().find("..") == 0)
+        return std::string();
     diag::log_tagged_fmt("browser", "compute_profile_path result=%s", base.c_str());
     return base;
 }
@@ -355,11 +390,25 @@ std::string spki_hash_prefix(const std::string& allowlist)
 
 namespace {
 
-void remove_directory_recursive(const std::string& path)
+bool remove_directory_recursive(const std::string& path)
 {
-    if (path.empty()) return;
+    if (path.empty()) return false;
     std::error_code ec;
-    std::filesystem::remove_all(path, ec);
+    const auto status = std::filesystem::symlink_status(path, ec);
+    if (ec || !std::filesystem::is_directory(status) || std::filesystem::is_symlink(status))
+        return false;
+    for (std::filesystem::directory_iterator it(path, std::filesystem::directory_options::skip_permission_denied, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        const auto child = it->path();
+        const auto child_status = std::filesystem::symlink_status(child, ec);
+        if (ec || std::filesystem::is_symlink(child_status) ||
+            (std::filesystem::is_directory(child_status) && !remove_directory_recursive(child.string())))
+            return false;
+        if (!std::filesystem::is_directory(child_status) && !std::filesystem::remove(child, ec))
+            return false;
+        if (ec) return false;
+    }
+    return !ec;
 }
 
 std::wstring build_command_line(const std::string& browser_path,
@@ -440,12 +489,26 @@ bool launch(const browser_launch_config_t& cfg, uint32_t& out_pid)
     if (!st.initialized.load()) initialize();
 
     std::string profile_path = compute_profile_path(cfg.profile_subdir);
+    if (profile_path.empty()) {
+        set_err("invalid browser profile subdirectory");
+        diag::log_tagged_fmt("browser", "launch rejected invalid_profile_subdir=%s", cfg.profile_subdir.c_str());
+        return false;
+    }
     if (cfg.clear_profile_first) {
         diag::log_tagged_fmt("browser", "launch clearing_profile profile=%s policy=camoufox_only", profile_path.c_str());
-        remove_directory_recursive(profile_path);
+        if (!remove_directory_recursive(profile_path)) {
+            set_err("browser profile cleanup rejected or failed");
+            diag::log_tagged_fmt("browser", "launch profile_clear_rejected profile=%s", profile_path.c_str());
+            return false;
+        }
         std::error_code ec;
         std::filesystem::create_directories(profile_path, ec);
-        diag::log_tagged_fmt("browser", "launch profile_clear_result profile=%s ec=%d", profile_path.c_str(), ec.value());
+        if (ec) {
+            set_err("browser profile recreation failed");
+            diag::log_tagged_fmt("browser", "launch profile_clear_recreate_failed profile=%s ec=%d", profile_path.c_str(), ec.value());
+            return false;
+        }
+        diag::log_tagged_fmt("browser", "launch profile_clear_result profile=%s ec=0", profile_path.c_str());
     }
 
     const uint64_t probe_start_ms = now_ms();

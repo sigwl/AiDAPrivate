@@ -6,10 +6,14 @@
 #include <netnode.hpp>
 #include <prodir.h>
 #include <bcrypt.h>
+#include <cstring>
 #pragma comment(lib, "bcrypt.lib")
 
 #ifdef _WIN32
 #include <windows.h>
+#include <aclapi.h>
+#include <sddl.h>
+#pragma comment(lib, "advapi32.lib")
 #endif
 
 using json = nlohmann::json;
@@ -39,6 +43,24 @@ std::string generate_instance_id_local()
         id.push_back(hex[rnd[i] & 0x0f]);
     }
     return id;
+}
+
+std::string generate_capability_local(size_t bytes)
+{
+    std::vector<uint8_t> rnd(bytes, 0);
+    NTSTATUS st = BCryptGenRandom(nullptr, rnd.data(), static_cast<ULONG>(rnd.size()),
+                                  BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (st != 0)
+        return std::string();
+    static const char hex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(bytes * 2);
+    for (uint8_t value : rnd)
+    {
+        out.push_back(hex[value >> 4]);
+        out.push_back(hex[value & 0x0f]);
+    }
+    return out;
 }
 
 std::string sanitize_basename_for_entry(const std::string& input)
@@ -198,6 +220,116 @@ bool ensure_dir_recursive(const std::string& dir_path)
     return rc == 0 || qisdir(dir_path.c_str());
 }
 
+#ifdef _WIN32
+bool auth_file_acl_descriptor(PSECURITY_DESCRIPTOR& descriptor)
+{
+    descriptor = nullptr;
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return false;
+
+    DWORD size = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+    if (size == 0)
+    {
+        CloseHandle(token);
+        return false;
+    }
+    std::vector<unsigned char> token_data(size);
+    if (!GetTokenInformation(token, TokenUser, token_data.data(), size, &size))
+    {
+        CloseHandle(token);
+        return false;
+    }
+    CloseHandle(token);
+
+    auto* user = reinterpret_cast<TOKEN_USER*>(token_data.data());
+    LPSTR sid_string = nullptr;
+    if (!ConvertSidToStringSidA(user->User.Sid, &sid_string))
+        return false;
+    std::string sddl = "D:P(A;;FA;;;SY)(A;;FA;;;";
+    sddl += sid_string;
+    sddl += ")";
+    LocalFree(sid_string);
+    return ConvertStringSecurityDescriptorToSecurityDescriptorA(
+        sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr) != FALSE;
+}
+
+bool auth_file_acl_matches(HANDLE file)
+{
+    PSECURITY_DESCRIPTOR expected = nullptr;
+    if (!auth_file_acl_descriptor(expected))
+        return false;
+
+    PACL expected_acl = nullptr;
+    BOOL expected_present = FALSE;
+    BOOL expected_defaulted = FALSE;
+    bool valid = GetSecurityDescriptorDacl(expected, &expected_present, &expected_acl,
+                                            &expected_defaulted) != FALSE;
+
+    PSECURITY_DESCRIPTOR actual = nullptr;
+    PACL actual_acl = nullptr;
+    if (valid)
+    {
+        valid = GetSecurityInfo(file, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                nullptr, nullptr, &actual_acl, nullptr, &actual) == ERROR_SUCCESS;
+    }
+    if (valid)
+    {
+        valid = expected_present && expected_acl != nullptr && actual_acl != nullptr
+            && expected_acl->AclSize == actual_acl->AclSize
+            && memcmp(expected_acl, actual_acl, expected_acl->AclSize) == 0;
+    }
+    if (actual != nullptr)
+        LocalFree(actual);
+    if (expected != nullptr)
+        LocalFree(expected);
+    return valid;
+}
+
+bool auth_file_acl_matches(const std::string& path)
+{
+    HANDLE file = CreateFileA(path.c_str(), READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return false;
+    bool valid = auth_file_acl_matches(file);
+    CloseHandle(file);
+    return valid;
+}
+
+bool write_restricted_auth_file(const std::string& path, const std::string& content)
+{
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    if (!auth_file_acl_descriptor(descriptor))
+        return false;
+    SECURITY_ATTRIBUTES attributes = {};
+    attributes.nLength = sizeof(attributes);
+    attributes.lpSecurityDescriptor = descriptor;
+
+    HANDLE file = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               &attributes, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        LocalFree(descriptor);
+        return false;
+    }
+
+    DWORD written = 0;
+    bool valid = content.size() <= MAXDWORD
+        && WriteFile(file, content.data(), static_cast<DWORD>(content.size()), &written, nullptr) != FALSE
+        && written == content.size()
+        && FlushFileBuffers(file) != FALSE
+        && auth_file_acl_matches(file);
+    CloseHandle(file);
+    LocalFree(descriptor);
+    if (!valid)
+        DeleteFileA(path.c_str());
+    return valid;
+}
+#endif
+
 }
 
 json ida_instance_record_t::to_json() const
@@ -316,6 +448,18 @@ std::string instance_registry_t::self_file_path() const
     return dir + sep + _self.instance_id + ".json";
 }
 
+std::string instance_registry_t::auth_file_path(const std::string& instance_id) const
+{
+    std::string dir = registry_dir();
+    std::string sep =
+#ifdef _WIN32
+        "\\";
+#else
+        "/";
+#endif
+    return dir + sep + instance_id + ".auth";
+}
+
 uint64_t instance_registry_t::hash_string(const std::string& s) const
 {
     uint64_t h = 1469598103934665603ULL;
@@ -382,6 +526,116 @@ void instance_registry_t::compute_self_identity(int port, const std::string& bas
     refresh_multibinary_metadata_local(_self);
 }
 
+bool instance_registry_t::create_self_authentication()
+{
+    _self_auth.instance_id = _self.instance_id;
+    _self_auth.lifecycle_generation = generate_capability_local(16);
+    _self_auth.capability = generate_capability_local(32);
+    _self_auth.pid = _self.pid;
+    _self_auth.started_at_ms = _self.started_at_ms;
+    return !_self_auth.lifecycle_generation.empty() && !_self_auth.capability.empty();
+}
+
+bool instance_registry_t::write_self_authentication_file()
+{
+    const std::string path = auth_file_path(_self.instance_id);
+    const std::string tmp = path + ".tmp";
+    json j = {
+        {"instance_id", _self_auth.instance_id},
+        {"lifecycle_generation", _self_auth.lifecycle_generation},
+        {"pid", _self_auth.pid},
+        {"started_at_ms", _self_auth.started_at_ms},
+        {"capability", _self_auth.capability}
+    };
+    std::string content = json_dump_safe(j, 2) + "\n";
+#ifdef _WIN32
+    if (!write_restricted_auth_file(tmp, content))
+        return false;
+    if (MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == FALSE)
+    {
+        DeleteFileA(tmp.c_str());
+        return false;
+    }
+    if (!auth_file_acl_matches(path))
+    {
+        DeleteFileA(path.c_str());
+        return false;
+    }
+    return true;
+#else
+    FILE* fp = qfopen(tmp.c_str(), "wb");
+    if (!fp)
+        return false;
+    {
+        file_janitor_t fj(fp);
+        if (qfwrite(fp, content.c_str(), content.size()) != static_cast<ssize_t>(content.size()))
+            return false;
+    }
+    return ::rename(tmp.c_str(), path.c_str()) == 0;
+#endif
+}
+
+void instance_registry_t::delete_self_authentication_file()
+{
+    qunlink(auth_file_path(_self.instance_id).c_str());
+    _self_auth = ida_peer_authentication_t{};
+}
+
+bool instance_registry_t::load_authentication_file(const std::string& path,
+                                                   ida_peer_authentication_t& out) const
+{
+#ifdef _WIN32
+    HANDLE file = CreateFileA(path.c_str(), GENERIC_READ | READ_CONTROL,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE || !auth_file_acl_matches(file))
+    {
+        if (file != INVALID_HANDLE_VALUE)
+            CloseHandle(file);
+        return false;
+    }
+    LARGE_INTEGER file_size = {};
+    if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart <= 0 || file_size.QuadPart > 16 * 1024)
+    {
+        CloseHandle(file);
+        return false;
+    }
+    std::string raw(static_cast<size_t>(file_size.QuadPart), '\0');
+    DWORD read = 0;
+    bool read_ok = ReadFile(file, &raw[0], static_cast<DWORD>(raw.size()), &read, nullptr) != FALSE
+        && read == raw.size();
+    CloseHandle(file);
+    if (!read_ok)
+        return false;
+#else
+    FILE* fp = qfopen(path.c_str(), "rb");
+    if (!fp)
+        return false;
+    file_janitor_t fj(fp);
+    uint64 size = qfsize(fp);
+    if (size == 0 || size > 16 * 1024)
+        return false;
+    std::string raw(static_cast<size_t>(size), '\0');
+    if (qfread(fp, &raw[0], raw.size()) != static_cast<ssize_t>(raw.size()))
+        return false;
+#endif
+    try
+    {
+        json j = json::parse(raw);
+        out.instance_id = j.value("instance_id", "");
+        out.lifecycle_generation = j.value("lifecycle_generation", "");
+        out.pid = j.value("pid", static_cast<uint64_t>(0));
+        out.started_at_ms = j.value("started_at_ms", static_cast<uint64_t>(0));
+        out.capability = j.value("capability", "");
+        return !out.instance_id.empty() && !out.lifecycle_generation.empty()
+            && out.pid != 0 && out.started_at_ms != 0 && !out.capability.empty();
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
 std::string instance_registry_t::compute_config_entry_name(const std::string& base)
 {
     std::string sanitized = sanitize_basename_for_entry(base);
@@ -402,6 +656,8 @@ bool instance_registry_t::start(int port, const std::string& base_url,
     {
         std::lock_guard<std::mutex> lk(_mtx);
         compute_self_identity(port, base_url, mcp_url, sse_url);
+        if (!create_self_authentication())
+            return false;
     }
 
     if (!ensure_dir_recursive(registry_dir()))
@@ -414,6 +670,12 @@ bool instance_registry_t::start(int port, const std::string& base_url,
         std::lock_guard<std::mutex> lk(_mtx);
         prune_stale_locked();
         write_self_file();
+        if (!write_self_authentication_file())
+        {
+            delete_self_file();
+            delete_self_authentication_file();
+            return false;
+        }
         auto live = scan_locked();
         _last_known_peer_ids.clear();
         _last_known_peer_ids.reserve(live.size());
@@ -431,6 +693,9 @@ bool instance_registry_t::start(int port, const std::string& base_url,
     catch (const std::exception&)
     {
         _running = false;
+        std::lock_guard<std::mutex> lk(_mtx);
+        delete_self_file();
+        delete_self_authentication_file();
         return false;
     }
 
@@ -439,7 +704,7 @@ bool instance_registry_t::start(int port, const std::string& base_url,
 
 void instance_registry_t::stop()
 {
-    if (!_running.load() && !_heartbeat_thread.joinable())
+    if (!_running.load() && !_heartbeat_thread.joinable() && _self.instance_id.empty())
         return;
 
     _stop_requested = true;
@@ -451,6 +716,7 @@ void instance_registry_t::stop()
     {
         std::lock_guard<std::mutex> lk(_mtx);
         delete_self_file();
+        delete_self_authentication_file();
     }
 }
 
@@ -650,7 +916,83 @@ void instance_registry_t::prune_stale_locked() const
                 drop = true;
         }
         if (drop)
+        {
             qunlink(fp.c_str());
+            std::string auth_path = fp;
+            size_t suffix = auth_path.rfind(".json");
+            if (suffix != std::string::npos)
+                auth_path.replace(suffix, 5, ".auth");
+            qunlink(auth_path.c_str());
+        }
+    }
+
+    std::vector<std::string> live_auth_ids;
+    for (const auto& kv : entries)
+    {
+        const auto& rec = kv.second;
+        if (!rec.instance_id.empty() && rec.instance_id != _self.instance_id
+            && is_pid_alive(rec.pid) && rec.last_heartbeat_ms != 0)
+        {
+            uint64_t age = now > rec.last_heartbeat_ms ? now - rec.last_heartbeat_ms : 0;
+            if (age <= static_cast<uint64_t>(kStaleThresholdMs))
+                live_auth_ids.push_back(rec.instance_id);
+        }
+    }
+
+    qstring auth_pattern = dir.c_str();
+#ifdef _WIN32
+    auth_pattern.append("\\*.auth");
+#else
+    auth_pattern.append("/*.auth");
+#endif
+    qffblk64_t auth_blk;
+    int auth_rc = qfindfirst(auth_pattern.c_str(), &auth_blk, 0);
+    while (auth_rc == 0)
+    {
+        std::string fname = auth_blk.ff_name;
+        if (fname != "." && fname != "..")
+        {
+            const std::string suffix = ".auth";
+            if (fname.size() > suffix.size() && fname.compare(fname.size() - suffix.size(), suffix.size(), suffix) == 0)
+            {
+                std::string id = fname.substr(0, fname.size() - suffix.size());
+                bool keep = id == _self.instance_id
+                    || std::find(live_auth_ids.begin(), live_auth_ids.end(), id) != live_auth_ids.end();
+                if (!keep)
+                {
+                    std::string auth_path = dir;
+#ifdef _WIN32
+                    auth_path += "\\";
+#else
+                    auth_path += "/";
+#endif
+                    auth_path += fname;
+                    qunlink(auth_path.c_str());
+                }
+            }
+        }
+        auth_rc = qfindnext(&auth_blk);
+    }
+
+    qstring temp_pattern = dir.c_str();
+#ifdef _WIN32
+    temp_pattern.append("\\*.auth.tmp");
+#else
+    temp_pattern.append("/*.auth.tmp");
+#endif
+    qffblk64_t temp_blk;
+    int temp_rc = qfindfirst(temp_pattern.c_str(), &temp_blk, 0);
+    while (temp_rc == 0)
+    {
+        std::string temp_path = dir;
+#ifdef _WIN32
+        temp_path += "\\";
+#else
+        temp_path += "/";
+#endif
+        temp_path += temp_blk.ff_name;
+        qunlink(temp_path.c_str());
+        temp_rc = qfindnext(&temp_blk);
     }
 }
 
@@ -770,4 +1112,63 @@ bool instance_registry_t::find_instance_by_pid(uint64_t pid, ida_instance_record
         }
     }
     return false;
+}
+
+bool instance_registry_t::self_peer_authentication(ida_peer_authentication_t& out) const
+{
+    std::lock_guard<std::mutex> lk(_mtx);
+    if (!_running.load(std::memory_order_acquire) || _self_auth.instance_id.empty())
+        return false;
+    out = _self_auth;
+    return true;
+}
+
+bool instance_registry_t::load_peer_authentication(const std::string& instance_id,
+                                                   ida_peer_authentication_t& out) const
+{
+    if (instance_id.empty())
+        return false;
+    std::lock_guard<std::mutex> lk(_mtx);
+    if (instance_id == _self.instance_id)
+        return false;
+    auto all = scan_locked();
+    auto it = std::find_if(all.begin(), all.end(), [&](const ida_instance_record_t& item) {
+        return item.instance_id == instance_id;
+    });
+    if (it == all.end() || it->pid == 0 || it->started_at_ms == 0)
+        return false;
+    if (!load_authentication_file(auth_file_path(instance_id), out))
+        return false;
+    return out.instance_id == it->instance_id && out.pid == it->pid
+        && out.started_at_ms == it->started_at_ms;
+}
+
+bool instance_registry_t::authenticate_peer(const ida_peer_authentication_t& presented) const
+{
+    if (presented.instance_id.empty() || presented.lifecycle_generation.empty()
+        || presented.capability.empty())
+        return false;
+    std::lock_guard<std::mutex> lk(_mtx);
+    if (!_running.load(std::memory_order_acquire))
+        return false;
+    if (presented.instance_id == _self.instance_id)
+        return false;
+    auto all = scan_locked();
+    auto it = std::find_if(all.begin(), all.end(), [&](const ida_instance_record_t& item) {
+        return item.instance_id == presented.instance_id;
+    });
+    if (it == all.end() || it->pid != presented.pid || it->started_at_ms != presented.started_at_ms)
+        return false;
+    ida_peer_authentication_t stored;
+    if (!load_authentication_file(auth_file_path(presented.instance_id), stored))
+        return false;
+    if (stored.instance_id != it->instance_id || stored.pid != it->pid
+        || stored.started_at_ms != it->started_at_ms
+        || stored.lifecycle_generation != presented.lifecycle_generation
+        || stored.capability.size() != presented.capability.size())
+        return false;
+    unsigned char diff = 0;
+    for (size_t i = 0; i < stored.capability.size(); ++i)
+        diff |= static_cast<unsigned char>(stored.capability[i] ^ presented.capability[i]);
+    return diff == 0;
 }

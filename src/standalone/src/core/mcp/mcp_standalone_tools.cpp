@@ -934,13 +934,35 @@ tool_result_t handle_vm_bridge_attach(const json& params)
                 continue;
             items.push_back({{"pid", proc.pid}, {"name", proc.name}});
         }
-        return tool_result_t::ok("Enumerated processes", json{{"processes", items}});
+        const auto driver = driver_bridge::availability();
+        return tool_result_t::ok("Enumerated processes", json{
+            {"processes", items},
+            {"driver_available", driver.device_connected && driver.kernel_backend},
+            {"driver_state", driver.state},
+            {"driver_reason", driver.reason},
+            {"driver_detail", driver.detail}
+        });
     }
 
-tool_result_t ensure_attached()
+    tool_result_t ensure_attached()
     {
-        if (driver_bridge::attached_pid() == 0)
-            return error("No process is attached. Use sessions_manage action=attach_pid first.");
+        const auto driver = driver_bridge::availability();
+        json details{
+            {"driver_available", driver.device_connected && driver.kernel_backend},
+            {"driver_state", driver.state},
+            {"driver_reason", driver.reason},
+            {"driver_detail", driver.detail},
+            {"target_attached", driver.target_attached},
+            {"target_pid", driver.target_pid}
+        };
+        if (!driver.device_connected || !driver.kernel_backend)
+            return tool_result_t::error(
+                "Kernel driver is unavailable: " + driver.reason + ".",
+                "driver_unavailable", details);
+        if (!driver.target_attached)
+            return tool_result_t::error(
+                "No process is attached. Use sessions_manage action=attach_pid first.",
+                "driver_target_unavailable", details);
         return tool_result_t::ok("");
     }
 
@@ -2421,6 +2443,17 @@ tool_result_t ensure_attached()
                     break;
                 }
             }
+        }
+
+        if (!module_name.empty()) {
+            const auto driver = driver_bridge::availability();
+            out["driver_context"] = json{
+                {"available", driver.device_connected && driver.kernel_backend && driver.target_attached},
+                {"state", driver.state},
+                {"reason", driver.reason},
+                {"detail", driver.detail},
+                {"target_pid", driver.target_pid}
+            };
         }
 
         json address;

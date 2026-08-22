@@ -186,6 +186,12 @@ std::atomic<bool> s_ai_task_done{true};
 std::mutex        s_ai_task_done_mtx;
 std::condition_variable s_ai_task_done_cv;
 
+void finish_ai_task() noexcept
+{
+    s_ai_task_done.store(true, std::memory_order_release);
+    s_ai_task_done_cv.notify_all();
+}
+
 std::mutex   s_chat_session_mtx;
 std::string  s_chat_session_id;
 std::string  s_chat_last_assistant_message_id;
@@ -345,6 +351,8 @@ std::atomic<bool>        s_ide_ready_for_mcp_services{false};
 std::atomic<bool>        s_mcp_shutdown_in_flight{false};
 std::atomic<bool>        s_mcp_start_in_flight{false};
 std::atomic<uint64_t>    s_mcp_start_last_post_ms{0};
+std::mutex               s_mcp_lifecycle_mtx;
+std::condition_variable  s_mcp_lifecycle_cv;
 
 
 std::atomic<bool>        s_mcp_clients_connected{false};
@@ -387,7 +395,11 @@ struct mcp_start_in_flight_guard_t
 {
     ~mcp_start_in_flight_guard_t()
     {
-        s_mcp_start_in_flight.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(s_mcp_lifecycle_mtx);
+            s_mcp_start_in_flight.store(false, std::memory_order_release);
+        }
+        s_mcp_lifecycle_cv.notify_all();
     }
 };
 
@@ -967,7 +979,7 @@ std::string build_system_prompt(bool force_xml_fallback = false)
         "and description before using it, call `get_tool_descriptions` with the tool names you need.\n\n";
     prompt +=
         "For visible browser tasks, call `browser_lifecycle` with `action=launch` first when no Camoufox session is running, then call `browser_navigation` with `action=navigate` and a fully-qualified URL. "
-        "Users run `irm https://api.aidapro.net | iex`; that PowerShell launcher verifies the Camoufox browser sidecar while AiDA uses its bundled Python-launched Camoufox reverse-MCP source runtime. "
+        "AiDA uses the app-local Camoufox browser, Python runtime, and reverse-MCP source staged under its `deps` directory. "
         "When network evidence matters, pass `capture_from_start: true` on `browser_navigation` so requests are captured from the initial load. "
         "Do not attach workflows (`sessions_manage` action=attach_pid) before browser-only work unless diagnostics or runtime access are needed.\n\n";
     prompt +=
@@ -2105,6 +2117,17 @@ void run_agentic(std::string user_message,
     post_update(ai_update_t::ERR, "Reached maximum tool-calling rounds (" + std::to_string(max_turns) + "). Stopping.");
 }
 
+__declspec(noinline) void run_agentic_with_completion(
+    std::string& user_message,
+    std::vector<std::pair<std::string, std::string>>& history)
+{
+    __try {
+        run_agentic(std::move(user_message), std::move(history));
+    } __finally {
+        finish_ai_task();
+    }
+}
+
 void restore_workspace_state()
 {
     if (!g_sa_settings.workspace.root_path.empty())
@@ -2333,16 +2356,6 @@ void init_standalone_chat()
     diag::log_tagged("init_chat", "marketplace_autoconnect_deferred_until_authorized_ide");
     diag::log_tagged("init_chat", "marketplace_load_installed_done");
 
-    const std::string run_id = "init_" + std::to_string(GetCurrentProcessId()) + "_" + std::to_string(GetTickCount64());
-    diag::log_tagged_fmt("init_chat", "driver_bridge_initialize_start run_id=%s", run_id.c_str());
-    driver_bridge::initialize();
-    diag::log_tagged_fmt("init_chat",
-        "driver_bridge_initialize_done run_id=%s loaded=%d kernel=%d status=%.160s",
-        run_id.c_str(),
-        driver_bridge::is_loaded() ? 1 : 0,
-        driver_bridge::using_kernel_driver() ? 1 : 0,
-        driver_bridge::status().c_str());
-
     diag::log_tagged("init_chat", "restore_workspace_state_start");
     DWORD seh_rws = seh_restore_workspace_state();
     if (seh_rws != 0)
@@ -2352,8 +2365,6 @@ void init_standalone_chat()
     output_log::push(bottom_tab_t::output, "[init] AiDA Standalone initialized");
     if (s_server_started.load(std::memory_order_acquire))
         output_log::push(bottom_tab_t::mcp_log, "[mcp-server] Started on port " + std::to_string(g_sa_settings.mcp_port));
-    output_log::push(bottom_tab_t::driver_log, "[driver] Bridge initialized");
-
     s_initialized.store(true, std::memory_order_release);
 }
 
@@ -2404,29 +2415,40 @@ void start_authorized_mcp_services()
     if (last_post_ms != 0 && now_ms >= last_post_ms && now_ms - last_post_ms < 2000ULL)
         return;
 
-    bool expected = false;
-    if (!s_mcp_start_in_flight.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+    bool posted = false;
     {
-        static std::atomic<uint64_t> s_last_in_flight_log_ms{0};
-        const uint64_t last_log_ms = s_last_in_flight_log_ms.load(std::memory_order_acquire);
-        if (last_log_ms == 0 || now_ms - last_log_ms >= 2000ULL) {
-            s_last_in_flight_log_ms.store(now_ms, std::memory_order_release);
-            diag::log_tagged("init_chat", "authorized_mcp_services_start_already_in_flight");
+        std::lock_guard<std::mutex> lock(s_mcp_lifecycle_mtx);
+        if (s_mcp_shutdown_in_flight.load(std::memory_order_acquire)) {
+            diag::log_tagged("init_chat", "authorized_mcp_services_start_deferred_shutdown_in_flight");
+            return;
         }
-        return;
-    }
 
-    s_mcp_start_last_post_ms.store(now_ms, std::memory_order_release);
-    bool posted = submit_chat_task(
-        "authorized_mcp_services_start",
-        aida::infra::executor::domain_t::security_liveness,
-        "lifecycle_gate",
-        5,
-        [] {
-        start_authorized_mcp_services_worker();
-    });
+        bool expected = false;
+        if (!s_mcp_start_in_flight.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        {
+            static std::atomic<uint64_t> s_last_in_flight_log_ms{0};
+            const uint64_t last_log_ms = s_last_in_flight_log_ms.load(std::memory_order_acquire);
+            if (last_log_ms == 0 || now_ms - last_log_ms >= 2000ULL) {
+                s_last_in_flight_log_ms.store(now_ms, std::memory_order_release);
+                diag::log_tagged("init_chat", "authorized_mcp_services_start_already_in_flight");
+            }
+            return;
+        }
+
+        s_mcp_start_last_post_ms.store(now_ms, std::memory_order_release);
+        posted = submit_chat_task(
+            "authorized_mcp_services_start",
+            aida::infra::executor::domain_t::security_liveness,
+            "lifecycle_gate",
+            5,
+            [] {
+            start_authorized_mcp_services_worker();
+        });
+        if (!posted)
+            s_mcp_start_in_flight.store(false, std::memory_order_release);
+    }
     if (!posted) {
-        s_mcp_start_in_flight.store(false, std::memory_order_release);
+        s_mcp_lifecycle_cv.notify_all();
         diag::log_tagged("init_chat", "authorized_mcp_services_start_post_failed");
     }
 }
@@ -2441,6 +2463,10 @@ void shutdown_standalone_chat()
     ULONGLONG shutdown_start = shutdown_phase_begin("shutdown_standalone_chat");
     diag::log_tagged_critical("chat", "shutdown_standalone_chat enter");
     log_shutdown_queue_snapshot("shutdown_enter");
+    {
+        std::lock_guard<std::mutex> lock(s_mcp_lifecycle_mtx);
+        s_mcp_shutdown_in_flight.store(true, std::memory_order_release);
+    }
     s_cancel = true;
     {
         ULONGLONG phase_start = shutdown_phase_begin("ai_task_cancel");
@@ -2454,6 +2480,12 @@ void shutdown_standalone_chat()
         shutdown_phase_done("ai_task_cancel", phase_start);
     }
     ULONGLONG producer_start = shutdown_phase_begin("producer_stop");
+    {
+        std::unique_lock<std::mutex> lock(s_mcp_lifecycle_mtx);
+        s_mcp_lifecycle_cv.wait(lock, [] {
+            return !s_mcp_start_in_flight.load(std::memory_order_acquire);
+        });
+    }
     s_mcp_server.stop();
     s_server_started.store(false, std::memory_order_release);
     mcp_standalone::set_ide_lifecycle_ready(false);
@@ -2486,6 +2518,10 @@ void shutdown_standalone_chat()
     (void)aida::session::shutdown();
     shutdown_phase_done("session_shutdown", session_start);
 
+    ULONGLONG dependency_start = shutdown_phase_begin("driver_stop_before_queue_drain");
+    driver_bridge::shutdown("chat.before_queue_drain");
+    shutdown_phase_done("driver_stop_before_queue_drain", dependency_start);
+
     ULONGLONG queue_start = shutdown_phase_begin("queue_drain");
     log_shutdown_queue_snapshot("queue_drain_before");
     aida::infra::executor::shutdown();
@@ -2506,12 +2542,11 @@ void shutdown_standalone_chat()
     shutdown_phase_done("conversation_store_commit", conversation_commit_start);
 
     if (queues_quiescent) {
-        ULONGLONG dependency_start = shutdown_phase_begin("driver_event_shutdown");
-        driver_bridge::shutdown("chat.shutdown_after_queues");
+        dependency_start = shutdown_phase_begin("event_shutdown");
         aida::events::shutdown();
-        shutdown_phase_done("driver_event_shutdown", dependency_start);
+        shutdown_phase_done("event_shutdown", dependency_start);
     } else {
-        diag::log_tagged_critical("chat", "driver_event_shutdown_deferred reason=queue_drain_incomplete");
+        diag::log_tagged_critical("chat", "event_shutdown_deferred reason=queue_drain_incomplete");
     }
 
     ULONGLONG persist_start = shutdown_phase_begin("persist_state");
@@ -2736,15 +2771,28 @@ void tick_ai_chat()
             "bounded_task",
             3,
             [user_text = std::move(user_text), history = std::move(history)]() mutable {
-            run_agentic(std::move(user_text), std::move(history));
-            s_ai_task_done.store(true);
-            s_ai_task_done_cv.notify_all();
+            try {
+                run_agentic_with_completion(user_text, history);
+            } catch (const std::exception& e) {
+                diag::log_tagged_critical_fmt("chat",
+                    "run_agentic_unhandled_exception what=%.512s", e.what());
+                output_log::push(bottom_tab_t::output,
+                    std::string("[ai] Unhandled exception: ") + e.what());
+                post_update(ai_update_t::ERR, std::string("Exception: ") + e.what());
+                throw;
+            } catch (...) {
+                diag::log_tagged_critical("chat",
+                    "run_agentic_unhandled_exception what=<unknown>");
+                output_log::push(bottom_tab_t::output,
+                    "[ai] Unhandled unknown exception.");
+                post_update(ai_update_t::ERR, "Unknown exception while processing AI request.");
+                throw;
+            }
         });
         if (!posted) {
             post_update(ai_update_t::ERR, "Error: Service unavailable. Please restart the application.");
             s_ai_running = false;
-            s_ai_task_done.store(true);
-            s_ai_task_done_cv.notify_all();
+            finish_ai_task();
         }
     }
 }

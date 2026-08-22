@@ -5,7 +5,7 @@
 
 namespace functions {
     NTSTATUS handle777d(p_dtb_solve request);
-    NTSTATUS handle777e(p_physical_rw request);
+    NTSTATUS handle777e(p_physical_rw request, KPROCESSOR_MODE requestor_mode);
     NTSTATUS handle777f(p_base_address request);
     NTSTATUS handle7781(p_remote_call request);
     NTSTATUS handle7782(p_call_result request);

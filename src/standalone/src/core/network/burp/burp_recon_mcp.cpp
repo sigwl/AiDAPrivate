@@ -90,6 +90,8 @@ json crawler_status_to_json(const crawler::crawl_status_t& s)
     j["ms_since_last_progress"] = s.last_progress_unix_ms != 0 && now >= s.last_progress_unix_ms ? now - s.last_progress_unix_ms : 0;
     j["pages_per_sec"] = s.pages_per_sec;
     j["in_flight"] = s.in_flight;
+    j["finished"] = s.finished;
+    j["cancelled"] = s.cancelled;
     j["last_url"] = s.last_url;
     j["last_error"] = s.last_error;
     return j;
@@ -119,6 +121,10 @@ json disc_status_to_json(const content_discovery::disc_status_t& s)
     j["calibrated_size_hi"] = s.calibrated_size_hi;
     j["started_unix_ms"] = s.started_unix_ms;
     j["finished_unix_ms"] = s.finished_unix_ms;
+    j["finished"] = s.finished;
+    j["cancelled"] = s.cancelled;
+    j["last_error"] = s.last_error;
+    j["last_url"] = s.last_url;
     return j;
 }
 

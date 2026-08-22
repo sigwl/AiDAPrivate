@@ -2980,7 +2980,7 @@ void render_selected_context_menu(sub_tab_t pane) {
 								result->detail = "The target changed before the region dump started.";
 							} else {
 								std::vector<uint8_t> bytes;
-								result->ok = driver_bridge::read_memory(context.address,
+								result->ok = driver_bridge::read_memory_for(context.target_pid, context.address,
 									static_cast<size_t>(capped_size), bytes) && bytes.size() == capped_size;
 								if (!result->ok)
 									result->detail = "Region dump read failed or returned a partial result.";
@@ -4856,7 +4856,7 @@ static void render_modules_overlay(ImDrawList* dl, float ox, float oy, float w, 
 							debugger_interaction::current_stop_generation() != target_generation)
 							result->detail = "The target changed before the module dump started.";
 						else {
-							result->ok = driver_bridge::read_memory(base_copy,
+							result->ok = driver_bridge::read_memory_for(target_pid, base_copy,
 								static_cast<size_t>(size_copy), buf) && buf.size() == size_copy;
 							if (!result->ok)
 								result->detail = "Module dump read failed or returned a partial result.";
@@ -9032,10 +9032,6 @@ void render_global_target_dialog() {
 		const std::wstring sandbox_dir = result.sandbox_dir;
 		if (options.isolation == run_target::isolation_t::windows_sandbox)
 			run_target::cleanup(result);
-		else if (result.thread_handle != 0) {
-			CloseHandle(reinterpret_cast<HANDLE>(result.thread_handle));
-			result.thread_handle = 0;
-		}
 		std::string error;
 		if (!ok) {
 			error = debugger_engine::last_error();

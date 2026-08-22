@@ -19,11 +19,18 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
 namespace script_engine {
 
+extern "C" int aida_lua_abi_release(void);
+extern "C" int aida_lua_registry_index(void);
+extern "C" size_t aida_lua_number_sizes(void);
+
+static_assert(LUA_VERSION_RELEASE_NUM == 50408);
+static_assert(LUA_REGISTRYINDEX == -1001000);
 
 static std::mutex                    g_mutex;
 static std::unique_ptr<sol::state>   g_lua;
@@ -897,10 +904,36 @@ bool initialize() {
         return g_initialized.load(std::memory_order_acquire);
     }
 
-    const char* phase = "local_alloc";
+    const char* phase = "abi_check";
     std::unique_ptr<sol::state> local_lua;
     void* published_lua_state = nullptr;
     try {
+        diag::log_tagged_fmt("script_eng", "initialize_phase_pre phase=%s tid=%lu elapsed_ms=%llu",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+        const int linked_release = aida_lua_abi_release();
+        const int linked_registry_index = aida_lua_registry_index();
+        const size_t linked_number_sizes = aida_lua_number_sizes();
+        diag::log_tagged_fmt("script_eng",
+            "initialize_lua_abi header_release=%d linked_release=%d header_registry=%d linked_registry=%d header_number_sizes=%zu linked_number_sizes=%zu",
+            LUA_VERSION_RELEASE_NUM,
+            linked_release,
+            LUA_REGISTRYINDEX,
+            linked_registry_index,
+            static_cast<size_t>(LUAL_NUMSIZES),
+            linked_number_sizes);
+        if (linked_release != LUA_VERSION_RELEASE_NUM ||
+            linked_registry_index != LUA_REGISTRYINDEX ||
+            linked_number_sizes != static_cast<size_t>(LUAL_NUMSIZES)) {
+            throw std::runtime_error("Lua static library ABI does not match its public headers");
+        }
+        diag::log_tagged_fmt("script_eng", "initialize_phase_post phase=%s tid=%lu elapsed_ms=%llu",
+            phase,
+            tid,
+            static_cast<unsigned long long>(now_ms() - started));
+
+        phase = "local_alloc";
         diag::log_tagged_fmt("script_eng", "initialize_phase_pre phase=%s tid=%lu elapsed_ms=%llu",
             phase,
             tid,

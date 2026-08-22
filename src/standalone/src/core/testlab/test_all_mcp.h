@@ -2,6 +2,8 @@
 #include <Windows.h>
 #include <atomic>
 
+#include "test_mcp_context.hpp"
+
 namespace test_all_features {
-    void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped, bool(*cancelled)());
+    void phase_mcp_tests(HANDLE hf, const mcp_phase_context_t& context);
 }

@@ -9,6 +9,7 @@ namespace test_all_features {
 	bool post_hotkey_trigger(const char* source);
 	bool trigger_from_hotkey(const char* source);
 	void cancel_tests();
+	void cancel_tests_for_shutdown();
 	void begin_test_guard(const char* source);
 	void end_test_guard(const char* source);
 	void render_overlay(float vw, float vh);

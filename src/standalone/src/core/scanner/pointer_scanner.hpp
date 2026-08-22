@@ -281,12 +281,13 @@ inline void build_reverse_map()
 	sub.thread_class = "scanner_pointer_map";
 	sub.domain = aida::infra::executor::domain_t::long_running;
 	sub.priority = 2;
-	sub.target_pid = driver_bridge::attached_pid();
+		sub.target_pid = driver_bridge::attached_pid();
+	const uint32_t target_pid = sub.target_pid;
 	sub.lease_token = brm_admission.token();
-	sub.body = []() {
+	sub.body = [target_pid]() {
 		auto t_start = std::chrono::steady_clock::now();
-		auto modules = driver_bridge::enumerate_modules();
-		auto regions = driver_bridge::enumerate_memory_regions(4096);
+		auto modules = driver_bridge::enumerate_modules_for(target_pid);
+		auto regions = driver_bridge::enumerate_memory_regions_for(target_pid, 4096);
 
 		std::vector<driver_bridge::memory_region_t> readable;
 		for (auto& r : regions) {
@@ -322,7 +323,8 @@ inline void build_reverse_map()
 					read_sz = static_cast<size_t>(region.size - off);
 
 				std::vector<uint8_t> data;
-				if (!driver_bridge::read_memory(region.base + off, read_sz, data)) {
+				if (!driver_bridge::read_memory_for(target_pid, region.base + off, read_sz, data) ||
+					data.size() != read_sz) {
 					scanned += read_sz;
 					g_state.map_progress.store(static_cast<float>(scanned) / static_cast<float>(total_bytes));
 					continue;
@@ -495,7 +497,8 @@ inline void start_scan()
 	sub.priority = 2;
 	sub.target_pid = driver_bridge::attached_pid();
 	sub.lease_token = ss_admission.token();
-	sub.body = []() {
+		const uint32_t target_pid = sub.target_pid;
+		sub.body = [target_pid]() {
 		try {
 		auto t_start = std::chrono::steady_clock::now();
 		std::vector<pointer_chain_t> results;
@@ -600,9 +603,12 @@ inline bool validate_chain(const pointer_chain_t& chain)
 	}
 
 	uint64_t current = base_addr;
+	const uint32_t target_pid = driver_bridge::attached_pid();
+	if (target_pid == 0)
+		return false;
 	for (size_t i = 0; i < chain.offsets.size(); ++i) {
 		std::vector<uint8_t> buf;
-		if (!driver_bridge::read_memory(current, 8, buf) || buf.size() < 8)
+		if (!driver_bridge::read_memory_for(target_pid, current, 8, buf) || buf.size() < 8)
 			return false;
 
 		uint64_t ptr_value = 0;

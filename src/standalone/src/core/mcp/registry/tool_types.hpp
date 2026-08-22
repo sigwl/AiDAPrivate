@@ -45,7 +45,7 @@ struct tool_result_t {
         return {false, text, {}, {}, {}, {}};
     }
     static tool_result_t error(const std::string& text, const json& details) {
-        return {false, text, details, {}, {}, {}};
+        return {false, text, {}, "MCP_TOOL_ERROR", details, {}};
     }
     static tool_result_t error(const std::string& text, const std::string& code,
                                const json& details = json::object()) {

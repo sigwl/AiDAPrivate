@@ -119,6 +119,16 @@ render_section_state_t            g_render_section;
 namespace {
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	std::atomic<bool>          g_chrome_shutdown_requested{false};
+	std::mutex                 g_chrome_shutdown_mutex;
+
+	bool claim_chrome_shutdown_admission_impl(const char* source)
+	{
+		std::lock_guard<std::mutex> shutdown_lock(g_chrome_shutdown_mutex);
+		const bool already_requested = g_chrome_shutdown_requested.exchange(true, std::memory_order_acq_rel);
+		diag::log_tagged_critical_fmt("chrome", "shutdown_admission source=%s already=%d",
+			source ? source : "<null>", already_requested ? 1 : 0);
+		return !already_requested;
+	}
 
 	aida::infra::executor::submit_result_t submit_helpers_executor_task(
 		const char* owner_subsystem,
@@ -1355,6 +1365,7 @@ namespace {
 		(void)cleanup_reason;
 		aida::preview::record(aida::preview::shell_action_t::close_window, source ? source : "render");
 #else
+		std::lock_guard<std::mutex> shutdown_lock(g_chrome_shutdown_mutex);
 		HWND hwnd = g_hwnd;
 		BOOL is_window = hwnd ? ::IsWindow(hwnd) : FALSE;
 		bool already_requested = g_chrome_shutdown_requested.exchange(true, std::memory_order_acq_rel);
@@ -1375,8 +1386,10 @@ namespace {
 		}
 
 		try {
-			test_all_features::cancel_tests();
-			aida::burp::camoufox::force_cleanup(cleanup_reason ? cleanup_reason : "chrome.shutdown");
+			test_all_features::cancel_tests_for_shutdown();
+			diag::log_tagged_fmt("chrome",
+				"shutdown_testlab_cancel_requested source=%s cleanup_owner=testlab",
+				source ? source : "<null>");
 		} catch (...) {
 			diag::log_tagged_critical_fmt("chrome",
 				"shutdown_camoufox_cleanup_exception source=%s",
@@ -1537,6 +1550,16 @@ namespace {
 	}
 #endif
 
+}
+
+bool claim_chrome_shutdown_admission(const char* source)
+{
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	(void)source;
+	return true;
+#else
+	return claim_chrome_shutdown_admission_impl(source);
+#endif
 }
 
 namespace ui_input_gate

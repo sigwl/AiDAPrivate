@@ -42,6 +42,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <map>
 #include <sstream>
 #include <string>
@@ -128,6 +129,14 @@ static void close_socket(SOCKET s) {
         ::shutdown(s, SD_BOTH);
         closesocket(s);
     }
+}
+
+static void set_shutdown_bounded_io(SOCKET s) {
+    constexpr DWORD timeout_ms = 1000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+        reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,
+        reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
 }
 
 const char* to_string(tls_observation_kind_t kind) {
@@ -2960,6 +2969,7 @@ static void listener_thread_func(state_t& state) {
                 reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
 
             if (client_sock == INVALID_SOCKET) continue;
+            set_shutdown_bounded_io(client_sock);
 
             work_item item;
             item.client_socket = static_cast<uintptr_t>(client_sock);
@@ -3068,6 +3078,7 @@ static void extra_listener_loop(std::shared_ptr<extra_listener_runtime_t> rt) {
         SOCKET client_sock = accept(rt->listen_socket, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
         if (client_sock == INVALID_SOCKET)
             continue;
+        set_shutdown_bounded_io(client_sock);
         work_item item;
         item.client_socket = static_cast<uintptr_t>(client_sock);
         item.client_ip = client_addr.sin_addr.s_addr;
@@ -3142,6 +3153,11 @@ static void stop_extra_listeners() {
 bool start(const proxy_config& config) {
     if (g_state.running.load()) {
         diag::log_tagged("network", "mitm_proxy_start_skip already_running");
+        return false;
+    }
+
+    if (!g_state.proxy_alive.load(std::memory_order_acquire)) {
+        diag::log_tagged("network", "mitm_proxy_start_failed workers_not_ready");
         return false;
     }
 
@@ -3341,7 +3357,7 @@ std::vector<listener_snapshot> get_listeners() {
 void pre_initialize() {
     diag::log_tagged_fmt("mitm", "pre_initialize entry worker_pool_size=%u", WORKER_POOL_SIZE);
     auto& st = g_state;
-    st.proxy_alive.store(true);
+    st.proxy_alive.store(true, std::memory_order_release);
 
     state_t* st_ptr = &st;
 
@@ -3353,12 +3369,32 @@ void pre_initialize() {
     listener_sub.domain = aida::infra::executor::domain_t::service;
     listener_sub.priority = 4;
     listener_sub.body = [st_ptr]() {
+        try {
             listener_thread_func(*st_ptr);
+        } catch (const std::exception& ex) {
             st_ptr->listener_done.store(true, std::memory_order_release);
-        };
-    bool listener_posted = aida::infra::executor::submit(std::move(listener_sub)).submitted;
+            st_ptr->running.store(false, std::memory_order_release);
+            st_ptr->proxy_alive.store(false, std::memory_order_release);
+            st_ptr->work_cv.notify_all();
+            st_ptr->proxy_start_cv.notify_all();
+            diag::log_tagged_fmt("mitm", "listener_thread_exception type=std what=%s", ex.what());
+            return;
+        } catch (...) {
+            st_ptr->listener_done.store(true, std::memory_order_release);
+            st_ptr->running.store(false, std::memory_order_release);
+            st_ptr->proxy_alive.store(false, std::memory_order_release);
+            st_ptr->work_cv.notify_all();
+            st_ptr->proxy_start_cv.notify_all();
+            diag::log_tagged("mitm", "listener_thread_exception type=unknown");
+            return;
+        }
+        st_ptr->listener_done.store(true, std::memory_order_release);
+    };
+    const auto listener_submission = aida::infra::executor::submit(std::move(listener_sub));
+    const bool listener_posted = listener_submission.submitted;
     if (!listener_posted) {
-        diag::log_tagged("mitm", "pre_initialize listener_post_failed");
+        diag::log_tagged_fmt("mitm", "pre_initialize listener_post_failed reason=%s",
+            listener_submission.reject_reason.empty() ? "unknown" : listener_submission.reject_reason.c_str());
         st.listener_done.store(true, std::memory_order_release);
     } else {
         diag::log_tagged("mitm", "pre_initialize listener_posted");
@@ -3373,34 +3409,96 @@ void pre_initialize() {
         worker_sub.domain = aida::infra::executor::domain_t::service;
         worker_sub.priority = 4;
         worker_sub.body = [st_ptr]() {
+            try {
                 worker_thread_func(*st_ptr);
-                st_ptr->active_worker_count.fetch_sub(1, std::memory_order_acq_rel);
-            };
-        bool worker_posted = aida::infra::executor::submit(std::move(worker_sub)).submitted;
+            } catch (const std::exception& ex) {
+                const auto previous = st_ptr->active_worker_count.fetch_sub(1, std::memory_order_acq_rel);
+                if (previous == 1) {
+                    st_ptr->running.store(false, std::memory_order_release);
+                    st_ptr->proxy_alive.store(false, std::memory_order_release);
+                    st_ptr->proxy_start_cv.notify_all();
+                }
+                diag::log_tagged_fmt("mitm", "worker_thread_exception type=std what=%s", ex.what());
+                return;
+            } catch (...) {
+                const auto previous = st_ptr->active_worker_count.fetch_sub(1, std::memory_order_acq_rel);
+                if (previous == 1) {
+                    st_ptr->running.store(false, std::memory_order_release);
+                    st_ptr->proxy_alive.store(false, std::memory_order_release);
+                    st_ptr->proxy_start_cv.notify_all();
+                }
+                diag::log_tagged("mitm", "worker_thread_exception type=unknown");
+                return;
+            }
+            st_ptr->active_worker_count.fetch_sub(1, std::memory_order_acq_rel);
+        };
+        const auto worker_submission = aida::infra::executor::submit(std::move(worker_sub));
+        const bool worker_posted = worker_submission.submitted;
         if (!worker_posted) {
-            diag::log_tagged_fmt("mitm", "pre_initialize worker_post_failed i=%u", i);
+            diag::log_tagged_fmt("mitm", "pre_initialize worker_post_failed i=%u reason=%s", i,
+                worker_submission.reject_reason.empty() ? "unknown" : worker_submission.reject_reason.c_str());
             st.active_worker_count.fetch_sub(1, std::memory_order_acq_rel);
         } else {
             diag::log_tagged_fmt("mitm", "pre_initialize worker_posted i=%u", i);
         }
     }
-    diag::log_tagged_fmt("mitm", "pre_initialize complete worker_count=%d", (int)st.active_worker_count.load());
+    const auto submitted_worker_count = st.active_worker_count.load(std::memory_order_acquire);
+    if (!listener_posted || submitted_worker_count == 0) {
+        st.proxy_alive.store(false, std::memory_order_release);
+        st.proxy_start_cv.notify_all();
+        diag::log_tagged_fmt("mitm", "pre_initialize not_alive listener_posted=%d workers=%u",
+            listener_posted ? 1 : 0, submitted_worker_count);
+    }
+    diag::log_tagged_fmt("mitm", "pre_initialize complete worker_count=%d", (int)submitted_worker_count);
 }
 
 void shutdown() {
-    diag::log_tagged_fmt("mitm", "shutdown entry active_workers=%d", (int)g_state.active_worker_count.load());
+    const uint64_t started = GetTickCount64();
+    size_t pending_count = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_state.work_mutex);
+        pending_count = g_state.pending_work.size();
+    }
+    diag::log_tagged_fmt("mitm",
+        "shutdown entry running=%d proxy_alive=%d active_workers=%u active_connections=%u pending=%zu listener_done=%d",
+        g_state.running.load(std::memory_order_acquire) ? 1 : 0,
+        g_state.proxy_alive.load(std::memory_order_acquire) ? 1 : 0,
+        g_state.active_worker_count.load(std::memory_order_acquire),
+        g_state.active_connections.load(std::memory_order_acquire), pending_count,
+        g_state.listener_done.load(std::memory_order_acquire) ? 1 : 0);
     auto& st = g_state;
     stop();
     st.proxy_alive.store(false);
+    size_t discarded = 0;
+    {
+        std::lock_guard<std::mutex> lock(st.work_mutex);
+        while (!st.pending_work.empty()) {
+            close_socket(static_cast<SOCKET>(st.pending_work.front().client_socket));
+            st.pending_work.pop();
+            ++discarded;
+        }
+    }
     st.work_cv.notify_all();
     st.proxy_start_cv.notify_all();
     diag::log_tagged("mitm", "shutdown draining_workers");
-    while (st.active_worker_count.load(std::memory_order_acquire) > 0)
+    const uint64_t worker_deadline = GetTickCount64() + 10000;
+    while (st.active_worker_count.load(std::memory_order_acquire) > 0 && GetTickCount64() < worker_deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (st.active_worker_count.load(std::memory_order_acquire) > 0)
+        diag::log_tagged_fmt("mitm", "shutdown workers_not_drained active_workers=%u",
+            st.active_worker_count.load(std::memory_order_acquire));
     diag::log_tagged("mitm", "shutdown draining_listener");
-    while (!st.listener_done.load(std::memory_order_acquire))
+    const uint64_t listener_deadline = GetTickCount64() + 10000;
+    while (!st.listener_done.load(std::memory_order_acquire) && GetTickCount64() < listener_deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    diag::log_tagged("mitm", "shutdown complete");
+    if (!st.listener_done.load(std::memory_order_acquire))
+        diag::log_tagged("mitm", "shutdown listener_not_drained");
+    diag::log_tagged_fmt("mitm",
+        "shutdown complete elapsed_ms=%llu active_workers=%u active_connections=%u discarded=%zu listener_done=%d",
+        static_cast<unsigned long long>(GetTickCount64() - started),
+        st.active_worker_count.load(std::memory_order_acquire),
+        st.active_connections.load(std::memory_order_acquire), discarded,
+        st.listener_done.load(std::memory_order_acquire) ? 1 : 0);
 }
 
 std::vector<http_exchange> get_history(size_t max_count) {

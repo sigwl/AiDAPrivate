@@ -951,7 +951,7 @@ namespace driver_loader
             &cmdline[0],
             nullptr, nullptr,
             FALSE,
-            CREATE_NO_WINDOW,
+            CREATE_NO_WINDOW | CREATE_SUSPENDED,
             nullptr, nullptr,
             &si, &pi);
 
@@ -983,27 +983,82 @@ namespace driver_loader
         s_materialization_summary.mapper_tid = pi.dwThreadId;
 
         HANDLE hJob = CreateJobObjectW(nullptr, nullptr);
+        bool job_contained = false;
+        DWORD job_gle = ERROR_SUCCESS;
         if (hJob) {
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
             jeli.BasicLimitInformation.LimitFlags =
                 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
                 JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-            SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
-                                    &jeli, sizeof(jeli));
-            BOOL assigned = AssignProcessToJobObject(hJob, pi.hProcess);
-            loader_diag_fmt("mapper_job assigned=%d gle=%lu",
-                assigned ? 1 : 0, static_cast<unsigned long>(GetLastError()));
+            if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
+                                         &jeli, sizeof(jeli))) {
+                job_gle = GetLastError();
+                loader_diag_fmt("mapper_job configure_failed gle=%lu",
+                    static_cast<unsigned long>(job_gle));
+            } else if (!AssignProcessToJobObject(hJob, pi.hProcess)) {
+                job_gle = GetLastError();
+                loader_diag_fmt("mapper_job assign_failed gle=%lu",
+                    static_cast<unsigned long>(job_gle));
+            } else {
+                job_contained = true;
+                loader_diag("mapper_job assigned=1");
+            }
         } else {
-            loader_diag_fmt("mapper_job create_failed gle=%lu", static_cast<unsigned long>(GetLastError()));
+            job_gle = GetLastError();
+            loader_diag_fmt("mapper_job create_failed gle=%lu", static_cast<unsigned long>(job_gle));
+        }
+
+        if (!job_contained) {
+            TerminateProcess(pi.hProcess, ERROR_PROCESS_ABORTED);
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            if (hJob)
+                CloseHandle(hJob);
+            s_materialization_summary.whoswho_deleted = cleanup_stage_file(whoswho_path, "whoswho") ? 1 : 0;
+            s_materialization_summary.stage_dir_deleted = cleanup_stage_dir(stage) ? 1 : 0;
+            set_last_error_fmt("Mapper job containment setup failed gle=%lu",
+                static_cast<unsigned long>(job_gle));
+            return false;
+        }
+
+        if (ResumeThread(pi.hThread) == static_cast<DWORD>(-1)) {
+            DWORD resume_gle = GetLastError();
+            TerminateProcess(pi.hProcess, ERROR_PROCESS_ABORTED);
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            CloseHandle(hJob);
+            s_materialization_summary.whoswho_deleted = cleanup_stage_file(whoswho_path, "whoswho") ? 1 : 0;
+            s_materialization_summary.stage_dir_deleted = cleanup_stage_dir(stage) ? 1 : 0;
+            set_last_error_fmt("ResumeThread failed for contained mapper gle=%lu",
+                static_cast<unsigned long>(resume_gle));
+            return false;
         }
 
         DWORD wait_result = WaitForSingleObject(pi.hProcess, 90000);
-        DWORD wait_gle = GetLastError();
+        DWORD wait_gle = wait_result == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
         s_materialization_summary.mapper_wait_result = wait_result;
         s_materialization_summary.mapper_wait_gle = wait_gle;
         loader_diag_fmt("mapper_wait result=0x%08lX gle=%lu",
             static_cast<unsigned long>(wait_result),
             static_cast<unsigned long>(wait_gle));
+
+        if (wait_result == WAIT_TIMEOUT) {
+            loader_diag("mapper_timeout_terminate_begin");
+            BOOL terminated = TerminateProcess(pi.hProcess, ERROR_TIMEOUT);
+            DWORD terminate_gle = terminated ? ERROR_SUCCESS : GetLastError();
+            if (!terminated && hJob) {
+                TerminateJobObject(hJob, ERROR_TIMEOUT);
+            }
+            DWORD terminate_wait = WaitForSingleObject(pi.hProcess, 5000);
+            DWORD terminate_wait_gle = terminate_wait == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+            loader_diag_fmt("mapper_timeout_terminate_end terminated=%d terminate_gle=%lu wait=0x%08lX wait_gle=%lu",
+                terminated ? 1 : 0,
+                static_cast<unsigned long>(terminate_gle),
+                static_cast<unsigned long>(terminate_wait),
+                static_cast<unsigned long>(terminate_wait_gle));
+        }
 
         DWORD exit_code = 1;
         BOOL got_exit = GetExitCodeProcess(pi.hProcess, &exit_code);

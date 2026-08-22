@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cwctype>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <map>
 #include <mutex>
@@ -135,9 +136,6 @@ constexpr DWORD kPythonInstallerDownloadDeadlineMs = 180000;
 constexpr DWORD kPythonRuntimeInstallTimeoutMs = 300000;
 constexpr wchar_t kCamoufoxBrowserDirName[] = L"camoufox-135.0.1-beta.24-win.x86_64";
 constexpr char kReverseMcpPackageSpec[] = "camoufox-reverse-mcp";
-constexpr char kReverseMcpInitiatorContractV2[] = "aida_initiator_contract_v2_page_marker";
-constexpr char kReverseMcpAddonPolicyContractV1[] = "aida_default_addon_policy_v1";
-constexpr char kReverseMcpLaunchPolicyContractV1[] = "aida_fast_visible_policy_v1";
 
 bool env_flag_enabled(const wchar_t* name)
 {
@@ -395,6 +393,12 @@ std::vector<std::wstring> aida_runtime_base_dirs()
 bool discover_reverse_mcp_source_dir(std::wstring& out_dir)
 {
     const std::wstring name = L"camoufox-reverse-mcp";
+    const std::wstring staged = join_path_w(join_path_w(executable_dir_w(), L"deps"), name);
+    if (file_exists_w(join_path_w(staged, L"pyproject.toml")))
+    {
+        out_dir = staged;
+        return true;
+    }
     for (const auto& base : aida_runtime_base_dirs())
     {
         std::wstring candidate = join_path_w(join_path_w(base, L"deps"), name);
@@ -1054,7 +1058,7 @@ bool validate_app_local_python_w(const std::wstring& python_exe, std::string& lo
     DWORD code = 0;
     std::string captured;
     std::string cmd = quote_arg(wide_to_utf8(python_exe)) +
-        " -c \"import sys, pip; assert sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 13; print(f'{sys.version_info.major}.{sys.version_info.minor}')\"";
+        " -I -c \"import sys, pip; assert sys.implementation.name == 'cpython' and sys.version_info[:2] == (3, 12); print('CPython 3.12')\"";
     if (!spawn_capture_streaming(cmd, 30000, code, captured))
     {
         log += "app-local Python validation spawn failed\n";
@@ -1974,87 +1978,16 @@ DWORD contract_probe_timeout_ms(DWORD timeout_ms)
     return std::max<DWORD>(timeout_ms, 30000);
 }
 
-bool captured_json_true_field(const std::string& captured, const char* field)
-{
-    if (!field || !*field) return false;
-    const std::string key = std::string("\"") + field + "\"";
-    size_t pos = 0;
-    while ((pos = captured.find(key, pos)) != std::string::npos)
-    {
-        pos += key.size();
-        while (pos < captured.size() && std::isspace(static_cast<unsigned char>(captured[pos]))) ++pos;
-        if (pos >= captured.size() || captured[pos] != ':') continue;
-        ++pos;
-        while (pos < captured.size() && std::isspace(static_cast<unsigned char>(captured[pos]))) ++pos;
-        if (captured.compare(pos, 4, "true") == 0)
-            return true;
-    }
-    return false;
-}
-
 bool validate_contract_probe_output(const std::string& captured, std::string& detail)
 {
-    const bool has_contract = captured.find(kReverseMcpInitiatorContractV2) != std::string::npos;
-    const bool has_addon_policy_contract = captured.find(kReverseMcpAddonPolicyContractV1) != std::string::npos;
-    const bool has_launch_policy_contract = captured.find(kReverseMcpLaunchPolicyContractV1) != std::string::npos;
-    const bool has_request_id = captured.find("request_id") != std::string::npos;
-    const bool has_page_id = captured.find("page_id") != std::string::npos;
-    const bool has_marker_param =
-        captured.find("\"marker\"") != std::string::npos ||
-        captured.find(",marker") != std::string::npos ||
-        captured.find("marker,") != std::string::npos ||
-        captured.find("marker]") != std::string::npos;
-    const bool addon_policy_contract_ok = captured_json_true_field(captured, "addon_policy_contract_ok");
-    const bool addon_policy_marker_present = captured_json_true_field(captured, "addon_policy_marker_present");
-    const bool default_ubo_exclusion_present = captured_json_true_field(captured, "default_ubo_exclusion_present");
-    const bool exclude_addons_marker_present = captured_json_true_field(captured, "exclude_addons_marker_present");
-    const bool addon_invalid_diagnostic_present = captured_json_true_field(captured, "addon_invalid_diagnostic_present");
-    const bool addon_all_launch_scope_present = captured_json_true_field(captured, "addon_all_launch_scope_present");
-    const bool fast_visible_policy_contract_ok = captured_json_true_field(captured, "fast_visible_policy_contract_ok");
-    const bool fast_visible_policy_marker_present = captured_json_true_field(captured, "fast_visible_policy_marker_present");
-    const bool fast_visible_disabled_return_present = captured_json_true_field(captured, "fast_visible_disabled_return_present");
-    const bool fast_visible_fallback_ignored_present = captured_json_true_field(captured, "fast_visible_fallback_ignored_present");
-    const bool fast_visible_forbidden_return_absent = captured_json_true_field(captured, "fast_visible_forbidden_return_absent");
-    const bool fast_visible_compat_path_absent = captured_json_true_field(captured, "fast_visible_compat_path_absent");
-    const bool fast_visible_selected_async_present = captured_json_true_field(captured, "fast_visible_selected_async_present");
-    if (has_contract && has_addon_policy_contract && has_launch_policy_contract && has_request_id && has_page_id && has_marker_param &&
-        addon_policy_contract_ok &&
-        addon_policy_marker_present &&
-        default_ubo_exclusion_present &&
-        exclude_addons_marker_present &&
-        addon_invalid_diagnostic_present &&
-        addon_all_launch_scope_present &&
-        fast_visible_policy_contract_ok &&
-        fast_visible_policy_marker_present &&
-        fast_visible_disabled_return_present &&
-        fast_visible_fallback_ignored_present &&
-        fast_visible_forbidden_return_absent &&
-        fast_visible_compat_path_absent &&
-        fast_visible_selected_async_present)
-    {
+    if (captured.find("\"runtime_marker\": \"AIDA_CAMOUFOX_RUNTIME_CONTRACT_OK\"") != std::string::npos &&
+        captured.find("\"contract\": \"AIDA_INITIATOR_CONTRACT_V2\"") != std::string::npos &&
+        captured.find("\"ok\": true") != std::string::npos &&
+        captured.find("\"initiator_params\"") != std::string::npos) {
         detail = compact_log_tail(captured, 800);
         return true;
     }
-    detail = "contract_probe_missing_fields contract=" + std::to_string(has_contract ? 1 : 0) +
-        " addon_contract=" + std::to_string(has_addon_policy_contract ? 1 : 0) +
-        " launch_policy_contract=" + std::to_string(has_launch_policy_contract ? 1 : 0) +
-        " request_id=" + std::to_string(has_request_id ? 1 : 0) +
-        " page_id=" + std::to_string(has_page_id ? 1 : 0) +
-        " marker=" + std::to_string(has_marker_param ? 1 : 0) +
-        " addon_policy=" + std::to_string(addon_policy_contract_ok ? 1 : 0) +
-        " addon_marker=" + std::to_string(addon_policy_marker_present ? 1 : 0) +
-        " default_ubo_exclusion=" + std::to_string(default_ubo_exclusion_present ? 1 : 0) +
-        " exclude_addons=" + std::to_string(exclude_addons_marker_present ? 1 : 0) +
-        " addon_invalid_diag=" + std::to_string(addon_invalid_diagnostic_present ? 1 : 0) +
-        " addon_all_launch_scope=" + std::to_string(addon_all_launch_scope_present ? 1 : 0) +
-        " fast_visible_policy=" + std::to_string(fast_visible_policy_contract_ok ? 1 : 0) +
-        " fast_visible_marker=" + std::to_string(fast_visible_policy_marker_present ? 1 : 0) +
-        " fast_visible_disabled=" + std::to_string(fast_visible_disabled_return_present ? 1 : 0) +
-        " fast_visible_ignored_log=" + std::to_string(fast_visible_fallback_ignored_present ? 1 : 0) +
-        " fast_visible_forbidden_return_absent=" + std::to_string(fast_visible_forbidden_return_absent ? 1 : 0) +
-        " fast_visible_compat_absent=" + std::to_string(fast_visible_compat_path_absent ? 1 : 0) +
-        " fast_visible_selected_async=" + std::to_string(fast_visible_selected_async_present ? 1 : 0) +
-        " tail=" + compact_log_tail(captured, 800);
+    detail = "runtime_contract_marker_missing tail=" + compact_log_tail(captured, 800);
     return false;
 }
 
@@ -2063,7 +1996,7 @@ bool validate_python_reverse_mcp_contract(const std::string& python, DWORD timeo
     DWORD code = 0;
     std::string captured;
     const DWORD effective_timeout = contract_probe_timeout_ms(timeout_ms);
-    const std::string cmd = quote_arg(python) + " -m camoufox_reverse_mcp --aida-contract-check";
+    const std::string cmd = quote_arg(python) + " -I -m camoufox_reverse_mcp --aida-contract-check";
     const ULONGLONG start_ms = GetTickCount64();
     diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe python start python=%s timeout_ms=%lu",
         python.c_str(), static_cast<unsigned long>(effective_timeout));
@@ -2222,6 +2155,37 @@ bool install_reverse_mcp_from_wheelhouse(const std::string& python, std::string&
     diag::log_tagged_fmt("camoufox_install", "reverse_mcp wheelhouse install failed code=%lu path=%s out=%.400s",
         static_cast<unsigned long>(code), wheelhouse.c_str(), detail.c_str());
     return false;
+}
+
+bool install_reverse_mcp_from_source(const std::string& python, const std::wstring& module_dir, std::string& out_log)
+{
+    const std::wstring package_source = join_path_w(join_path_w(module_dir, L"src"), L"camoufox_reverse_mcp");
+    if (!file_exists_w(join_path_w(package_source, L"__init__.py")))
+        return false;
+
+    if (!run_install_command(python,
+        "installing camoufox reverse-MCP runtime dependencies",
+        "mcp==1.29.0 \"camoufox[geoip]>=0.4.0\" \"playwright>=1.40.0\"",
+        "--upgrade-strategy only-if-needed mcp==1.29.0 \"camoufox[geoip]>=0.4.0\" \"playwright>=1.40.0\"",
+        "camoufox reverse-MCP runtime dependency install failed",
+        out_log))
+        return false;
+
+    const std::wstring python_root = parent_dir_w(utf8_to_wide(python));
+    const std::wstring site_packages = join_path_w(join_path_w(python_root, L"Lib"), L"site-packages");
+    const std::wstring package_target = join_path_w(site_packages, L"camoufox_reverse_mcp");
+    if (!directory_exists_w(site_packages))
+    {
+        out_log += "app-local Python site-packages directory missing at " + wide_to_utf8(site_packages) + "\n";
+        return false;
+    }
+    if (!copy_directory_tree_w(package_source, package_target, out_log))
+        return false;
+
+    out_log += "installed bundled camoufox-reverse-mcp source without build backend\n";
+    diag::log_tagged_fmt("camoufox_install", "reverse_mcp source install ok source=%s target=%s",
+        wide_to_utf8(package_source).c_str(), wide_to_utf8(package_target).c_str());
+    return true;
 }
 
 status_t snapshot_status(const char* fallback_message = nullptr)
@@ -2706,27 +2670,27 @@ bool pip_install_module(std::string& out_log)
     if (!ensure_python_for_setup(python, out_log)) return false;
 
     std::wstring module_dir;
-    if (install_reverse_mcp_from_wheelhouse(python, out_log))
-        return true;
-
     if (!discover_reverse_mcp_source_dir(module_dir))
     {
+        if (install_reverse_mcp_from_wheelhouse(python, out_log))
+            return true;
         std::lock_guard<std::mutex> lk(sg().mtx);
         sg().last_error = std::string("camoufox-reverse-mcp wheelhouse wheel not found and no app-local source checkout was found\n") + setup_instructions();
         set_status_locked(install_state_t::install_failed, sg().last_error);
         return false;
     }
 
-    const std::string module_arg = quote_arg(wide_to_utf8(module_dir));
-    if (!run_install_command(python,
-        "installing camoufox-reverse-mcp",
-        "-e " + module_arg,
-        "--upgrade-strategy only-if-needed -e " + module_arg,
-        "camoufox-reverse-mcp install failed",
-        out_log))
+    if (!install_reverse_mcp_from_source(python, module_dir, out_log))
+    {
+        std::lock_guard<std::mutex> lk(sg().mtx);
+        sg().last_error = out_log.empty()
+            ? std::string("bundled camoufox-reverse-mcp source install failed")
+            : std::string("bundled camoufox-reverse-mcp source install failed: ") + compact_log(out_log);
+        set_status_locked(install_state_t::install_failed, sg().last_error);
         return false;
+    }
     std::lock_guard<std::mutex> lk(sg().mtx);
-    set_status_locked(install_state_t::available, "pip install completed");
+    set_status_locked(install_state_t::available, "bundled camoufox-reverse-mcp source install completed");
     sg().last_error.clear();
     return true;
 }
@@ -2803,85 +2767,109 @@ bool fetch_browser(std::string& out_log)
     return true;
 }
 
-bool pip_install_async()
+namespace {
+
+using install_operation_t = bool (*)(std::string&);
+
+void record_async_failure(const char* operation, const std::string& cause)
+{
+    std::string failure;
+    {
+        std::lock_guard<std::mutex> lk(sg().mtx);
+        failure = cause.empty() ? sg().last_error : cause;
+        if (failure.empty())
+            failure = std::string(operation) + " failed without diagnostic output";
+        else if (failure.compare(0, std::strlen(operation), operation) != 0)
+            failure = std::string(operation) + " failed: " + failure;
+        sg().last_error = failure;
+        set_status_locked(install_state_t::install_failed, sg().last_error);
+    }
+    diag::log_tagged_fmt("camoufox_install", "async_failure operation=%s detail=%.1200s",
+        operation, failure.c_str());
+}
+
+bool submit_install_operation(const char* label, const char* operation, install_operation_t execute)
 {
     bool expected = false;
     if (!sg().busy.compare_exchange_strong(expected, true))
     {
         std::lock_guard<std::mutex> lk(sg().mtx);
         sg().last_error = "install task already running";
+        diag::log_tagged_fmt("camoufox_install", "async_rejected operation=%s reason=%s",
+            operation, sg().last_error.c_str());
         return false;
     }
-    bool posted = [&]() {
+
+    try
+    {
         ::aida::infra::executor::submission_t sub;
         sub.owner_subsystem = "burp.camoufox_install";
-        sub.label = "camoufox.pip_install";
+        sub.label = label;
         sub.thread_class = "bounded_task";
         sub.domain = aida::infra::executor::domain_t::external_tool;
         sub.priority = 3;
-        sub.body = []() {
-        std::string log;
-        try { pip_install_module(log); } catch (...) {}
+        sub.body = [operation, execute]() {
+            struct busy_reset_t
+            {
+                ~busy_reset_t() { sg().busy.store(false, std::memory_order_release); }
+            } busy_reset;
+
+            std::string log;
+            try
+            {
+                if (!execute(log))
+                    record_async_failure(operation, compact_log_tail(log));
+            }
+            catch (const std::exception& ex)
+            {
+                record_async_failure(operation, std::string("exception: ") + ex.what());
+            }
+            catch (...)
+            {
+                record_async_failure(operation, "unknown exception");
+            }
+        };
+
+        const auto result = ::aida::infra::executor::submit(std::move(sub));
+        if (result.submitted)
+            return true;
+
         sg().busy.store(false, std::memory_order_release);
-    };
-        return ::aida::infra::executor::submit(std::move(sub)).submitted;
-    }();
-    if (!posted) sg().busy.store(false, std::memory_order_release);
-    return posted;
+        const std::string reason = result.reject_reason.empty()
+            ? "executor rejected submission without a reason"
+            : std::string("executor rejected submission: ") + result.reject_reason;
+        record_async_failure(operation, reason);
+        return false;
+    }
+    catch (const std::exception& ex)
+    {
+        sg().busy.store(false, std::memory_order_release);
+        record_async_failure(operation, std::string("executor submission exception: ") + ex.what());
+        return false;
+    }
+    catch (...)
+    {
+        sg().busy.store(false, std::memory_order_release);
+        record_async_failure(operation, "executor submission unknown exception");
+        return false;
+    }
+}
+
+}
+
+bool pip_install_async()
+{
+    return submit_install_operation("camoufox.pip_install", "camoufox module install", pip_install_module);
 }
 
 bool repair_runtime_dependencies_async()
 {
-    bool expected = false;
-    if (!sg().busy.compare_exchange_strong(expected, true))
-    {
-        std::lock_guard<std::mutex> lk(sg().mtx);
-        sg().last_error = "install task already running";
-        return false;
-    }
-    bool posted = [&]() {
-        ::aida::infra::executor::submission_t sub;
-        sub.owner_subsystem = "burp.camoufox_install";
-        sub.label = "camoufox.repair_runtime";
-        sub.thread_class = "bounded_task";
-        sub.domain = aida::infra::executor::domain_t::external_tool;
-        sub.priority = 3;
-        sub.body = []() {
-        std::string log;
-        try { repair_runtime_dependencies(log); } catch (...) {}
-        sg().busy.store(false, std::memory_order_release);
-    };
-        return ::aida::infra::executor::submit(std::move(sub)).submitted;
-    }();
-    if (!posted) sg().busy.store(false, std::memory_order_release);
-    return posted;
+    return submit_install_operation("camoufox.repair_runtime", "camoufox runtime dependency repair", repair_runtime_dependencies);
 }
 
 bool fetch_browser_async()
 {
-    bool expected = false;
-    if (!sg().busy.compare_exchange_strong(expected, true))
-    {
-        std::lock_guard<std::mutex> lk(sg().mtx);
-        sg().last_error = "install task already running";
-        return false;
-    }
-    bool posted = [&]() {
-        ::aida::infra::executor::submission_t sub;
-        sub.owner_subsystem = "burp.camoufox_install";
-        sub.label = "camoufox.fetch_browser";
-        sub.thread_class = "bounded_task";
-        sub.domain = aida::infra::executor::domain_t::external_tool;
-        sub.priority = 3;
-        sub.body = []() {
-        std::string log;
-        try { fetch_browser(log); } catch (...) {}
-        sg().busy.store(false, std::memory_order_release);
-    };
-        return ::aida::infra::executor::submit(std::move(sub)).submitted;
-    }();
-    if (!posted) sg().busy.store(false, std::memory_order_release);
-    return posted;
+    return submit_install_operation("camoufox.fetch_browser", "camoufox browser fetch", fetch_browser);
 }
 
 status_t get_status()
@@ -2899,12 +2887,10 @@ std::string last_error()
 std::string setup_instructions()
 {
     return
-        "Run AiDA from the PowerShell launcher:\n"
-        "irm https://api.aidapro.net | iex\n"
-        "The launcher verifies the Camoufox browser sidecar, extracts it to %LOCALAPPDATA%\\AiDA\\Standalone\\camoufox\\current, and sets the Camoufox environment for this AiDA session.\n"
-        "The private camoufox-reverse-mcp implementation ships as Python source staged beside AiDAStandalone.exe under deps\\camoufox-reverse-mcp and runs with AiDA's bundled Python runtime from deps\\camoufox-runtime (python -I -m camoufox_reverse_mcp).\n"
-        "Python 3.10-3.13 x64 is only required when the bundled Python runtime is unavailable and AiDA must fall back to an app-local interpreter.\n"
-        "After launch, use browser_lifecycle with action=launch. If it is still missing, send aida_bootstrap.log and the browser_lifecycle result.\n"
+        "AiDA requires an app-local Camoufox browser at deps\\camoufox-135.0.1-beta.24-win.x86_64\\camoufox.exe.\n"
+        "AiDA requires camoufox-reverse-mcp source at deps\\camoufox-reverse-mcp and an app-local Python runtime at deps\\camoufox-runtime\\python.exe.\n"
+        "AiDA requires CPython 3.12 x64 because the offline Camoufox wheelhouse targets Python 3.12.\n"
+        "After restoring those local dependencies, use browser_lifecycle with action=launch and inspect aida_debug.log plus the browser_lifecycle result if startup still fails.\n"
         "Advanced fallback: set AIDA_CAMOUFOX_EXECUTABLE to camoufox.exe and AIDA_CAMOUFOX_ALLOW_SYSTEM_PYTHON=1 before launching AiDA.\n";
 }
 

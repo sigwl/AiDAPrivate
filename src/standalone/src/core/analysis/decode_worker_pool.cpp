@@ -52,6 +52,20 @@ struct decode_completion_slot_t final {
     aida::infra::fast_blocking_queue<std::optional<tile_decode_completion_t>> queue;
 };
 
+class callback_active_guard_t final {
+public:
+    callback_active_guard_t(std::atomic<std::uint32_t>& active,
+        std::condition_variable& cv) noexcept : active_(active), cv_(cv) {}
+    ~callback_active_guard_t() {
+        if (active_.fetch_sub(1, std::memory_order_seq_cst) == 1)
+            cv_.notify_all();
+    }
+
+private:
+    std::atomic<std::uint32_t>& active_;
+    std::condition_variable& cv_;
+};
+
 thread_local void* tls_worker_state = nullptr;
 
 }
@@ -90,6 +104,8 @@ struct decode_worker_pool_t::impl_t final {
     std::atomic<completion_signal_t> completion_signal{nullptr};
     std::atomic<void*> completion_signal_context{nullptr};
     std::atomic<std::uint32_t> completion_signal_active{0};
+    std::mutex callback_mutex;
+    std::condition_variable callback_cv;
     std::atomic<std::uint64_t> completion_push_count{0};
     std::atomic<std::uint64_t> steal_count{0};
     std::atomic<std::uint64_t> backpressure_wait_count{0};
@@ -120,11 +136,19 @@ decode_worker_pool_t::lease_hook_t pool_hook(const decode_worker_pool_t::impl_t&
 
 void invoke_completion_signal(decode_worker_pool_t::impl_t& impl)
 {
-    impl.completion_signal_active.fetch_add(1, std::memory_order_seq_cst);
-    const auto signal = impl.completion_signal.load(std::memory_order_seq_cst);
-    if (signal != nullptr)
-        signal(impl.completion_signal_context.load(std::memory_order_seq_cst));
-    impl.completion_signal_active.fetch_sub(1, std::memory_order_seq_cst);
+    decode_worker_pool_t::completion_signal_t signal = nullptr;
+    void* context = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl.callback_mutex);
+        signal = impl.completion_signal.load(std::memory_order_seq_cst);
+        if (signal == nullptr)
+            return;
+        context = impl.completion_signal_context.load(std::memory_order_seq_cst);
+        impl.completion_signal_active.fetch_add(1, std::memory_order_seq_cst);
+    }
+    callback_active_guard_t active_guard(
+        impl.completion_signal_active, impl.callback_cv);
+    signal(context);
 }
 
 void note_queue_depth(decode_worker_pool_t::impl_t& impl, std::size_t depth)
@@ -171,6 +195,16 @@ tile_decode_completion_t decode_item(decode_worker_pool_t::worker_state_t& worke
         return completion;
     }
     const auto& request = item.request;
+    ::diag::log_tagged_fmt(kPhase,
+        "decode_begin worker=%u request_id=%llu tile_id=%u pass=%u start=0x%llX provider_offset=0x%llX bytes=%llu tid=%lu",
+        worker.index,
+        static_cast<unsigned long long>(request.request_id),
+        static_cast<unsigned>(request.tile_id),
+        static_cast<unsigned>(request.pass),
+        static_cast<unsigned long long>(request.start.value),
+        static_cast<unsigned long long>(request.provider_offset),
+        static_cast<unsigned long long>(request.byte_count),
+        static_cast<unsigned long>(GetCurrentThreadId()));
     if (impl.use_x86) {
         decode::x86_tile_decode_request_t x86_request;
         x86_request.start_address = request.start;
@@ -186,6 +220,13 @@ tile_decode_completion_t decode_item(decode_worker_pool_t::worker_state_t& worke
         auto result = worker.x86->decode_tile(*snapshot, x86_request, impl.cancellation);
         if (!result) {
             completion.error = result.error();
+            ::diag::log_tagged_fmt(kPhase,
+                "decode_end worker=%u request_id=%llu ok=0 code=%u msg=%s tid=%lu",
+                worker.index,
+                static_cast<unsigned long long>(request.request_id),
+                static_cast<unsigned>(completion.error->code),
+                completion.error->message.c_str(),
+                static_cast<unsigned long>(GetCurrentThreadId()));
             return completion;
         }
         auto decoded = result.take_value();
@@ -197,6 +238,16 @@ tile_decode_completion_t decode_item(decode_worker_pool_t::worker_state_t& worke
         completion.records.invalid_bytes = decoded.usage.invalid_bytes;
         completion.records.delay_slot_counts.resize(
             completion.records.instructions.size(), 0);
+        ::diag::log_tagged_fmt(kPhase,
+            "decode_end worker=%u request_id=%llu ok=1 instructions=%zu operands=%zu targets=%zu bytes=%llu invalid=%llu tid=%lu",
+            worker.index,
+            static_cast<unsigned long long>(request.request_id),
+            completion.records.instructions.size(),
+            completion.records.operand_facts.size(),
+            completion.records.target_facts.size(),
+            static_cast<unsigned long long>(completion.records.bytes_consumed),
+            static_cast<unsigned long long>(completion.records.invalid_bytes),
+            static_cast<unsigned long>(GetCurrentThreadId()));
         return completion;
     }
     decode::capstone_tile_identity_t identity;
@@ -214,6 +265,13 @@ tile_decode_completion_t decode_item(decode_worker_pool_t::worker_state_t& worke
     auto result = worker.capstone->decode_tile(*snapshot, identity, impl.cancellation);
     if (!result) {
         completion.error = result.error();
+        ::diag::log_tagged_fmt(kPhase,
+            "decode_end worker=%u request_id=%llu ok=0 code=%u msg=%s tid=%lu",
+            worker.index,
+            static_cast<unsigned long long>(request.request_id),
+            static_cast<unsigned>(completion.error->code),
+            completion.error->message.c_str(),
+            static_cast<unsigned long>(GetCurrentThreadId()));
         return completion;
     }
     auto decoded = result.take_value();
@@ -224,6 +282,16 @@ tile_decode_completion_t decode_item(decode_worker_pool_t::worker_state_t& worke
     completion.records.coverage = std::move(decoded.coverage);
     completion.records.bytes_consumed = decoded.usage.bytes_consumed;
     completion.records.invalid_bytes = decoded.usage.undecodable_bytes;
+    ::diag::log_tagged_fmt(kPhase,
+        "decode_end worker=%u request_id=%llu ok=1 instructions=%zu operands=%zu targets=%zu bytes=%llu invalid=%llu tid=%lu",
+        worker.index,
+        static_cast<unsigned long long>(request.request_id),
+        completion.records.instructions.size(),
+        completion.records.operand_facts.size(),
+        completion.records.target_facts.size(),
+        static_cast<unsigned long long>(completion.records.bytes_consumed),
+        static_cast<unsigned long long>(completion.records.invalid_bytes),
+        static_cast<unsigned long>(GetCurrentThreadId()));
     return completion;
 }
 
@@ -339,18 +407,22 @@ void worker_main_body(decode_worker_pool_t::worker_state_t& worker,
         for (;;) {
             if (impl.stop.load(std::memory_order_acquire))
                 break;
-            impl.hook_active.fetch_add(1, std::memory_order_seq_cst);
             void* hook_context = nullptr;
-            const auto hook = pool_hook(impl, hook_context);
+            decode_worker_pool_t::lease_hook_t hook = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(impl.callback_mutex);
+                hook = pool_hook(impl, hook_context);
+                if (hook != nullptr)
+                    impl.hook_active.fetch_add(1, std::memory_order_seq_cst);
+            }
             if (hook != nullptr) {
+                callback_active_guard_t active_guard(
+                    impl.hook_active, impl.callback_cv);
                 const bool lease_progress = hook(hook_context, worker.index);
-                impl.hook_active.fetch_sub(1, std::memory_order_seq_cst);
                 if (lease_progress)
                     continue;
                 if (lane_stop_requested(impl, lane_token))
                     break;
-            } else {
-                impl.hook_active.fetch_sub(1, std::memory_order_seq_cst);
             }
             if (impl.stop.load(std::memory_order_acquire))
                 break;
@@ -713,15 +785,35 @@ std::uint32_t decode_worker_pool_t::worker_count() const noexcept
 
 void decode_worker_pool_t::set_lease_hook(lease_hook_t hook, void* context) noexcept
 {
-    impl_->hook_context.store(context, std::memory_order_release);
-    impl_->hook.store(hook, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(impl_->callback_mutex);
+        impl_->hook_context.store(context, std::memory_order_release);
+        impl_->hook.store(hook, std::memory_order_release);
+    }
     for (auto& worker : impl_->workers)
         worker->cv.notify_all();
 }
 
 void decode_worker_pool_t::clear_lease_hook() noexcept
 {
-    impl_->hook.store(nullptr, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(impl_->callback_mutex);
+        impl_->hook.store(nullptr, std::memory_order_release);
+        impl_->hook_context.store(nullptr, std::memory_order_release);
+    }
+    const auto started = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock(impl_->callback_mutex);
+    impl_->callback_cv.wait(lock, [this] {
+        return impl_->hook_active.load(std::memory_order_seq_cst) == 0;
+    });
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    ::diag::log_tagged_fmt(kPhase,
+        "lease_hook_quiescent wait_us=%llu active=%u tid=%lu",
+        static_cast<unsigned long long>(elapsed),
+        impl_->hook_active.load(std::memory_order_seq_cst),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    lock.unlock();
     for (auto& worker : impl_->workers)
         worker->cv.notify_all();
 }
@@ -729,13 +821,32 @@ void decode_worker_pool_t::clear_lease_hook() noexcept
 void decode_worker_pool_t::set_completion_signal(completion_signal_t signal,
     void* context) noexcept
 {
+    std::lock_guard<std::mutex> lock(impl_->callback_mutex);
     impl_->completion_signal_context.store(context, std::memory_order_seq_cst);
     impl_->completion_signal.store(signal, std::memory_order_seq_cst);
 }
 
 void decode_worker_pool_t::clear_completion_signal() noexcept
 {
-    impl_->completion_signal.store(nullptr, std::memory_order_seq_cst);
+    {
+        std::lock_guard<std::mutex> lock(impl_->callback_mutex);
+        impl_->completion_signal.store(nullptr, std::memory_order_seq_cst);
+        impl_->completion_signal_context.store(nullptr, std::memory_order_seq_cst);
+    }
+    const auto started = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock(impl_->callback_mutex);
+    impl_->callback_cv.wait(lock, [this] {
+        return impl_->completion_signal_active.load(std::memory_order_seq_cst) == 0;
+    });
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    if (elapsed != 0) {
+        ::diag::log_tagged_fmt(kPhase,
+            "completion_signal_quiescent wait_us=%llu active=%u tid=%lu",
+            static_cast<unsigned long long>(elapsed),
+            impl_->completion_signal_active.load(std::memory_order_seq_cst),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    }
 }
 
 decode_worker_pool_statistics_t decode_worker_pool_t::statistics() const noexcept

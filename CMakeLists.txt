@@ -98,7 +98,10 @@ endif()
 set(DEPS_DIR "${CMAKE_SOURCE_DIR}/.deps")
 
 if(WIN32 AND MSVC)
-    set(_aida_openssl_root "$ENV{OPENSSL_ROOT_DIR}")
+    set(_aida_openssl_root "${OPENSSL_ROOT_DIR}")
+    if(NOT _aida_openssl_root)
+        set(_aida_openssl_root "$ENV{OPENSSL_ROOT_DIR}")
+    endif()
     if(NOT _aida_openssl_root OR NOT EXISTS "${_aida_openssl_root}/include/openssl/ssl.h")
         foreach(_candidate
             "C:/Program Files/OpenSSL-Win64"
@@ -682,9 +685,14 @@ list(REMOVE_ITEM LUA_CORE_SOURCES
     "${lua_src_SOURCE_DIR}/lua.c"           # standalone interpreter
     "${lua_src_SOURCE_DIR}/luac.c"          # standalone compiler
     "${lua_src_SOURCE_DIR}/onelua.c"        # single-file build; all sources already included individually
+    "${lua_src_SOURCE_DIR}/ltests.c"
 )
-add_library(lua54_static STATIC ${LUA_CORE_SOURCES})
+add_library(lua54_static STATIC
+    ${LUA_CORE_SOURCES}
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/src/core/tools/lua_abi.c"
+)
 target_include_directories(lua54_static PUBLIC "${lua_src_SOURCE_DIR}")
+target_compile_definitions(lua54_static PRIVATE AIDA_LUA_ABI_RELEASE=50408)
 set_target_properties(lua54_static PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED ON
@@ -698,6 +706,7 @@ if(MSVC)
 endif()
 
 set(sol2_SOURCE_DIR "${DEPS_DIR}/sol2")
+set(SOL2_LUA_VERSION "5.4.8" CACHE STRING "" FORCE)
 add_subdirectory("${sol2_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/.deps/sol2")
 
 if(MSVC AND TARGET x86_64-softmmu)
@@ -874,6 +883,9 @@ set(MSVC_STATIC OFF CACHE BOOL "" FORCE)
 set(TRITON_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/sources/Triton")
 set(TRITON_INSTALL_RULES OFF CACHE BOOL "" FORCE)
 add_subdirectory("${TRITON_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/.deps/triton")
+if(TARGET capstone_static AND NOT TARGET triton::capstone_static)
+    install(TARGETS capstone_static EXPORT tritonTargets DESTINATION lib/cmake/triton)
+endif()
 set(BUILD_SHARED_LIBS "${BUILD_SHARED_LIBS_SAVED_TRITON}")
 
 if(MSVC AND TARGET triton)
@@ -1127,7 +1139,7 @@ if(Python3_FOUND)
             BYPRODUCTS "${CMAKE_CURRENT_SOURCE_DIR}/src/whoswho_embedded.h"
             COMMAND ${Python3_EXECUTABLE} "${WHOSWHO_SCRIPT}" --from-binary "${WHOSWHO_BINARY}"
             COMMAND ${CMAKE_COMMAND} -E touch "${CMAKE_BINARY_DIR}/whoswho_embedded.stamp"
-            DEPENDS "${WHOSWHO_SCRIPT}"
+            DEPENDS "${WHOSWHO_SCRIPT}" "${WHOSWHO_BINARY}"
             WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
             COMMENT "Embedding WhosWho -> whoswho_embedded.h"
             VERBATIM
@@ -1459,6 +1471,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/mcp/ida_compat_read.cpp"
             "${STANDALONE_ROOT}/core/mcp/ida_compat_mut.cpp"
             "${STANDALONE_ROOT}/core/mcp/calculator_tool.cpp"
+            "${STANDALONE_ROOT}/core/mcp/calculator_engine.cpp"
             "${STANDALONE_ROOT}/core/mcp/schema_validator.cpp"
             "${STANDALONE_ROOT}/core/network/protocol_parser.cpp"
             "${STANDALONE_ROOT}/core/network/cert_generator.cpp"
@@ -2403,7 +2416,18 @@ if(WIN32)
         set(AIDA_BUNDLED_PYTHON_DIR "")
         foreach(AIDA_BUNDLED_PYTHON_CANDIDATE IN LISTS AIDA_BUNDLED_PYTHON_CANDIDATES)
             if(NOT AIDA_BUNDLED_PYTHON_DIR AND EXISTS "${AIDA_BUNDLED_PYTHON_CANDIDATE}/python.exe")
-                set(AIDA_BUNDLED_PYTHON_DIR "${AIDA_BUNDLED_PYTHON_CANDIDATE}")
+                execute_process(
+                    COMMAND "${AIDA_BUNDLED_PYTHON_CANDIDATE}/python.exe" -I -c "import sys; raise SystemExit(0 if sys.implementation.name == 'cpython' and sys.version_info[:2] == (3, 12) else 1)"
+                    RESULT_VARIABLE AIDA_BUNDLED_PYTHON_VERSION_RESULT
+                    TIMEOUT 10
+                    OUTPUT_QUIET
+                    ERROR_QUIET
+                )
+                if(AIDA_BUNDLED_PYTHON_VERSION_RESULT EQUAL 0)
+                    set(AIDA_BUNDLED_PYTHON_DIR "${AIDA_BUNDLED_PYTHON_CANDIDATE}")
+                else()
+                    message(STATUS "Ignoring non-CPython-3.12 Camoufox runtime: ${AIDA_BUNDLED_PYTHON_CANDIDATE}")
+                endif()
             endif()
         endforeach()
 
@@ -2412,13 +2436,13 @@ if(WIN32)
             if(NOT AIDA_CAMOUFOX_BROWSER_DIR)
                 message(WARNING "AiDA Camoufox sidecar staging enabled but camoufox browser was not found; staging disabled")
                 set(AIDA_CAMOUFOX_STAGE_SIDECAR_DEPS OFF)
-            elseif(NOT AIDA_BUNDLED_PYTHON_DIR AND NOT AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE)
-                message(WARNING "AiDA Camoufox sidecar staging enabled but neither a bundled Python runtime nor the camoufox-reverse-mcp source is available; staging disabled")
+            elseif(NOT AIDA_BUNDLED_PYTHON_DIR)
+                message(WARNING "AiDA Camoufox sidecar staging enabled but a bundled CPython 3.12 runtime was not found; offline staging disabled")
                 set(AIDA_CAMOUFOX_STAGE_SIDECAR_DEPS OFF)
             else()
                 set(AIDA_CAMOUFOX_STAGE_EFFECTIVE ON)
             endif()
-        elseif(AIDA_CAMOUFOX_BROWSER_DIR AND (AIDA_BUNDLED_PYTHON_DIR OR AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE))
+        elseif(AIDA_CAMOUFOX_BROWSER_DIR AND AIDA_BUNDLED_PYTHON_DIR AND AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE)
             set(AIDA_CAMOUFOX_STAGE_EFFECTIVE ON)
             message(STATUS "AiDA Camoufox app-local sidecar assets detected; staging enabled")
         elseif(AIDA_CAMOUFOX_BROWSER_DIR OR AIDA_BUNDLED_PYTHON_DIR OR AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE)
@@ -2458,15 +2482,6 @@ if(WIN32)
                 message(STATUS "AiDA Camoufox app-local Python runtime: ${AIDA_BUNDLED_PYTHON_DIR}")
             endif()
 
-            if(AIDA_BUNDLED_PYTHON_DIR OR AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE)
-                add_custom_command(TARGET AiDAStandalone POST_BUILD
-                    COMMAND ${CMAKE_COMMAND}
-                        "-DAIDA_CAMOUFOX_STAGE_ROOT=$<TARGET_FILE_DIR:AiDAStandalone>"
-                        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/aida_patch_camoufox_reverse_mcp.cmake"
-                    COMMENT "Patching staged Camoufox reverse MCP runtime..."
-                    VERBATIM
-                )
-            endif()
         endif()
 
         if(AIDA_CAMOUFOX_STAGE_EFFECTIVE)
@@ -2528,6 +2543,17 @@ if(WIN32)
                     VERBATIM
                 )
                 message(STATUS "AiDA Camoufox app-local wheelhouse: ${AIDA_CAMOUFOX_WHEELHOUSE_DIR}")
+            endif()
+
+            if(AIDA_CAMOUFOX_STAGE_REVERSE_MCP_SOURCE)
+                add_custom_command(TARGET AiDAStandalone POST_BUILD
+                    COMMAND ${CMAKE_COMMAND}
+                        "-DAIDA_CAMOUFOX_STAGE_ROOT=$<TARGET_FILE_DIR:AiDAStandalone>"
+                        "-DAIDA_CAMOUFOX_MCP_DIR=${AIDA_CAMOUFOX_MCP_DIR}"
+                        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/aida_patch_camoufox_reverse_mcp.cmake"
+                    COMMENT "Staging and verifying the offline Camoufox reverse MCP runtime..."
+                    VERBATIM
+                )
             endif()
         endif()
     endif()

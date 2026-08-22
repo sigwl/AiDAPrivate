@@ -939,6 +939,8 @@ bool parse_browser_url(const std::string& url, browser_url_t& out)
     out = browser_url_t{};
     if (url.empty())
         return false;
+    if (std::any_of(url.begin(), url.end(), [](unsigned char c) { return c < 0x20 || c == 0x7f; }))
+        return false;
     size_t scheme_pos = url.find("://");
     size_t authority_start = 0;
     if (scheme_pos != std::string::npos)
@@ -966,7 +968,12 @@ bool parse_browser_url(const std::string& url, browser_url_t& out)
         {
             try
             {
-                out.port = static_cast<uint16_t>(std::stoul(authority.substr(close + 2)));
+                const std::string port_text = authority.substr(close + 2);
+                size_t consumed = 0;
+                const unsigned long parsed = std::stoul(port_text, &consumed, 10);
+                if (consumed != port_text.size() || parsed == 0 || parsed > 65535)
+                    return false;
+                out.port = static_cast<uint16_t>(parsed);
             }
             catch (...) { return false; }
         }
@@ -979,7 +986,12 @@ bool parse_browser_url(const std::string& url, browser_url_t& out)
             out.host = authority.substr(0, colon);
             try
             {
-                out.port = static_cast<uint16_t>(std::stoul(authority.substr(colon + 1)));
+                const std::string port_text = authority.substr(colon + 1);
+                size_t consumed = 0;
+                const unsigned long parsed = std::stoul(port_text, &consumed, 10);
+                if (consumed != port_text.size() || parsed == 0 || parsed > 65535)
+                    return false;
+                out.port = static_cast<uint16_t>(parsed);
             }
             catch (...) { return false; }
         }
@@ -1836,6 +1848,16 @@ return JSON.stringify(out);
     return json::array();
 }
 
+std::filesystem::path screenshot_artifact_root()
+{
+    char temp[MAX_PATH] = {};
+    DWORD len = GetTempPathA(static_cast<DWORD>(sizeof(temp)), temp);
+    std::filesystem::path root = (len > 0 && len < static_cast<DWORD>(sizeof(temp)))
+        ? std::filesystem::path(temp)
+        : std::filesystem::temp_directory_path();
+    return root / "AiDA" / "camoufox-screenshots";
+}
+
 bool write_binary_file_utf8(const std::string& path, const std::vector<unsigned char>& bytes, std::string& error)
 {
     if (path.empty())
@@ -1843,14 +1865,39 @@ bool write_binary_file_utf8(const std::string& path, const std::vector<unsigned 
         error = "empty path";
         return false;
     }
-    ensure_parent_dir_exists(path);
+    std::error_code ec;
+    const std::filesystem::path root = std::filesystem::weakly_canonical(screenshot_artifact_root(), ec);
+    if (ec)
+    {
+        error = "artifact root resolution failed";
+        return false;
+    }
+    const std::filesystem::path candidate = std::filesystem::u8path(path);
+    const std::filesystem::path parent = std::filesystem::weakly_canonical(candidate.parent_path(), ec);
+    if (ec || parent.empty())
+    {
+        error = "artifact parent resolution failed";
+        return false;
+    }
+    const std::filesystem::path relative = parent.lexically_relative(root);
+    const bool outside_root = relative == ".." || (!relative.empty() && *relative.begin() == "..");
+    if (outside_root)
+    {
+        error = "artifact path outside screenshot directory";
+        return false;
+    }
+    if (!std::filesystem::create_directories(parent, ec) && ec)
+    {
+        error = "artifact parent creation failed";
+        return false;
+    }
     std::wstring wpath = utf8_to_wide_local(path);
     if (wpath.empty())
     {
         error = "path conversion failed";
         return false;
     }
-    HANDLE h = CreateFileW(wpath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE h = CreateFileW(wpath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE)
     {
         error = "CreateFileW failed gle=" + std::to_string(GetLastError());
@@ -1880,8 +1927,7 @@ std::string default_screenshot_path()
     char temp[MAX_PATH] = {};
     DWORD len = GetTempPathA(static_cast<DWORD>(sizeof(temp)), temp);
     std::filesystem::path root = (len > 0 && len < static_cast<DWORD>(sizeof(temp))) ? std::filesystem::path(temp) : std::filesystem::temp_directory_path();
-    root /= "AiDA";
-    root /= "camoufox-screenshots";
+    root = screenshot_artifact_root();
     std::error_code ec;
     std::filesystem::create_directories(root, ec);
     char name[128] = {};

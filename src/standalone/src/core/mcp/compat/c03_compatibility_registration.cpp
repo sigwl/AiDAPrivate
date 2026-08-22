@@ -305,9 +305,26 @@ namespace mcp_standalone
         wave_c_adapter_result(tool_result_t result)
         {
             if (!result.success) {
+                const std::string& source_code = result.error_code;
+                wave_c_compat::adapter_error_code_t adapter_code = wave_c_compat::adapter_error_code_t::backend_rejected;
+                if (source_code == "cancelled" || source_code == "CANCELLED")
+                    adapter_code = wave_c_compat::adapter_error_code_t::operation_not_permitted;
+                else if (source_code == "MCP_TOOL_TIMEOUT" || source_code == "deadline_exceeded")
+                    adapter_code = wave_c_compat::adapter_error_code_t::backend_unavailable;
+                else if (source_code == "MCP_TOOL_ADMISSION_REJECTED" || source_code == "MCP_TOOL_CAPACITY_REJECT")
+                    adapter_code = wave_c_compat::adapter_error_code_t::effect_lock_busy;
+                diag::log_tagged_fmt("mcp_c03", "adapter_error source_code='%s' source_text_len=%zu source_details=%d mapped_code=%u",
+                    source_code.empty() ? "<none>" : source_code.c_str(), result.text.size(),
+                    result.error_details.is_object() && !result.error_details.empty() ? 1 : 0,
+                    static_cast<unsigned int>(adapter_code));
                 return wave_c_compat::adapter_result_t<wave_c_compat::adapter_response_t>::failure(
-                    {wave_c_compat::adapter_error_code_t::backend_rejected,
-                     "workspace_backend_rejected", 0, 0});
+                    {adapter_code,
+                     source_code.empty() ? "workspace_backend_rejected" :
+                         (source_code == "cancelled" || source_code == "CANCELLED") ? "cancelled" :
+                         (source_code == "MCP_TOOL_TIMEOUT" || source_code == "deadline_exceeded") ? "deadline_exceeded" :
+                         (source_code == "MCP_TOOL_ADMISSION_REJECTED" || source_code == "MCP_TOOL_CAPACITY_REJECT") ? "capacity_rejected" :
+                         "workspace_backend_rejected",
+                     0, 0});
             }
             wave_c_compat::adapter_response_t response;
             response.payload = std::move(result.data).dump();

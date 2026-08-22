@@ -463,10 +463,71 @@ bool matches_any_pattern(const std::string& url, const std::vector<std::string>&
     return false;
 }
 
-void run_crawl(std::shared_ptr<crawl_t> ctx);
+using admission_ptr_t = std::shared_ptr<mcp_standalone::downstream::scoped_admission_t>;
+
+bool run_crawl(std::shared_ptr<crawl_t> ctx, admission_ptr_t admission);
+
+bool terminalize(const std::shared_ptr<crawl_t>& ctx, crawl_status_phase_t phase,
+                 const std::string& reason, bool cancelled)
+{
+    if (!ctx) return false;
+    const uint64_t finished_ms = now_ms();
+    {
+        std::lock_guard<std::mutex> lk(ctx->mtx);
+        if (ctx->finished.load(std::memory_order_acquire)) return false;
+        ctx->stop_flag.store(cancelled || phase == crawl_status_phase_t::error, std::memory_order_release);
+        ctx->queue.clear();
+        ctx->phase = phase;
+        if (!reason.empty()) ctx->last_error = reason;
+        ctx->finished_unix_ms = finished_ms;
+        ctx->last_progress_unix_ms = finished_ms;
+        ctx->finished.store(true, std::memory_order_release);
+    }
+    aida::events::publish(kJobStateChangedEvent, job_state_changed_t{
+        "crawler", ctx->id,
+        phase == crawl_status_phase_t::error ? "error" : "complete",
+        reason, finished_ms, cancelled, true});
+    diag::log_tagged_fmt("burp.crawler", "crawl_terminalized id=%llu phase=%d cancelled=%d reason=%s queued=0 in_flight=%d",
+        static_cast<unsigned long long>(ctx->id), static_cast<int>(phase), cancelled ? 1 : 0,
+        reason.empty() ? "<none>" : reason.c_str(), ctx->in_flight.load(std::memory_order_acquire));
+    return true;
+}
+
+bool schedule_crawl(std::shared_ptr<crawl_t> ctx, admission_ptr_t admission,
+                    const char* phase, std::chrono::milliseconds delay)
+{
+    const uint64_t token = admission->token();
+    diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-TRANSFER id=%llu token=%llu phase=%s",
+        static_cast<unsigned long long>(ctx->id), static_cast<unsigned long long>(token), phase);
+    ::aida::infra::executor::submission_t sub;
+    sub.owner_subsystem = "burp.crawler";
+    sub.label = delay.count() > 0 ? "crawler.wait" : "crawler.run_crawl";
+    sub.thread_class = "bounded_task";
+    sub.domain = aida::infra::executor::domain_t::feature_worker;
+    sub.priority = 3;
+    sub.body = [ctx, admission, token, phase, delay]() {
+        if (delay.count() > 0)
+            std::this_thread::sleep_for(delay);
+        const bool transferred = run_crawl(ctx, admission);
+        if (!transferred) {
+            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed phase=%s",
+                static_cast<unsigned long long>(ctx->id), static_cast<unsigned long long>(token), phase);
+            admission->release("completed");
+        }
+    };
+    if (::aida::infra::executor::submit(std::move(sub)).submitted)
+        return true;
+    diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=executor_unavailable phase=%s",
+        static_cast<unsigned long long>(ctx->id), static_cast<unsigned long long>(token), phase);
+    const bool cancelled = ctx->stop_flag.load(std::memory_order_acquire);
+    terminalize(ctx, cancelled ? crawl_status_phase_t::complete : crawl_status_phase_t::error,
+        std::string(phase) + " executor submission rejected", cancelled);
+    return false;
+}
 
 void enqueue_url(crawl_t& c, const std::string& url, int depth, const std::string& parent)
 {
+    if (c.finished.load(std::memory_order_acquire)) return;
     if (static_cast<int>(c.discovered.size()) >= c.config.max_pages) {
         diag::log_tagged_fmt("crawler", "enqueue_url id=%llu max_pages_reached url=%s", static_cast<unsigned long long>(c.id), url.c_str());
         return;
@@ -519,20 +580,22 @@ void enqueue_url(crawl_t& c, const std::string& url, int depth, const std::strin
         static_cast<unsigned long long>(c.id), canonical.c_str(), depth, c.queue.size());
 }
 
-void worker_step(std::shared_ptr<crawl_t> ctx, queue_item_t item)
+bool worker_step(std::shared_ptr<crawl_t> ctx, queue_item_t item, admission_ptr_t admission)
 {
     diag::log_tagged_fmt("crawler", "worker_step id=%llu url=%s depth=%d",
         static_cast<unsigned long long>(ctx->id), item.url.c_str(), item.depth);
-    ctx->in_flight.fetch_add(1);
     auto& c = *ctx;
     if (c.stop_flag.load()) {
         diag::log_tagged_fmt("crawler", "worker_step id=%llu stopped url=%s", static_cast<unsigned long long>(ctx->id), item.url.c_str());
         ctx->in_flight.fetch_sub(1);
-        return;
+        return schedule_crawl(ctx, std::move(admission), "continuation", std::chrono::milliseconds(0));
     }
 
     parsed_url_t p = parse_url(item.url);
-    if (!p.valid) { ctx->in_flight.fetch_sub(1); return; }
+    if (!p.valid) {
+        ctx->in_flight.fetch_sub(1);
+        return schedule_crawl(ctx, std::move(admission), "continuation", std::chrono::milliseconds(0));
+    }
 
     std::shared_ptr<host_rate_t> hr;
     {
@@ -578,14 +641,14 @@ void worker_step(std::shared_ptr<crawl_t> ctx, queue_item_t item)
         {
             log_line(c, "robots-blocked: " + item.url);
             ctx->in_flight.fetch_sub(1);
-            return;
+            return schedule_crawl(ctx, std::move(admission), "continuation", std::chrono::milliseconds(0));
         }
     }
 
     if (!host_rate_acquire(*hr, std::max(1, c.config.rate_per_host), c.stop_flag))
     {
         ctx->in_flight.fetch_sub(1);
-        return;
+        return schedule_crawl(ctx, std::move(admission), "continuation", std::chrono::milliseconds(0));
     }
 
     int status = 0;
@@ -599,6 +662,10 @@ void worker_step(std::shared_ptr<crawl_t> ctx, queue_item_t item)
     diag::log_tagged_fmt("crawler", "worker_step fetch_result id=%llu url=%s ok=%d status=%d body=%zu lat=%llu err=%s",
         static_cast<unsigned long long>(ctx->id), item.url.c_str(), ok ? 1 : 0,
         status, body.size(), static_cast<unsigned long long>(lat), err.c_str());
+    if (ctx->finished.load(std::memory_order_acquire)) {
+        ctx->in_flight.fetch_sub(1, std::memory_order_acq_rel);
+        return false;
+    }
 
     discovered_url_t d;
     d.url = item.url;
@@ -666,52 +733,14 @@ void worker_step(std::shared_ptr<crawl_t> ctx, queue_item_t item)
     }
 
     ctx->in_flight.fetch_sub(1);
-    {
-        mcp_standalone::downstream::producer_identity_t cont_id;
-        cont_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
-        cont_id.tool_name = "crawler.run_crawl";
-        cont_id.domain = c.config.start_urls.empty() ? std::string() : c.config.start_urls.front();
-        auto cont_admission = mcp_standalone::downstream::scoped_admission_t::acquire(cont_id);
-        if (!cont_admission.active()) {
-            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-REJECT id=%llu reason=%s quota=%s observed=%zu limit=%zu phase=continuation",
-                static_cast<unsigned long long>(c.id),
-                cont_admission.result().reason.c_str(),
-                cont_admission.result().quota_name.c_str(),
-                cont_admission.result().observed, cont_admission.result().limit);
-            return;
-        }
-        const uint64_t cont_token = cont_admission.token();
-        diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-ADMIT id=%llu token=%llu phase=continuation",
-            static_cast<unsigned long long>(c.id),
-            static_cast<unsigned long long>(cont_token));
-        auto cont_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(cont_admission));
-        if (![&]() {
-            ::aida::infra::executor::submission_t sub;
-            sub.owner_subsystem = "burp.crawler";
-            sub.label = "crawler.run_crawl";
-            sub.thread_class = "bounded_task";
-            sub.domain = aida::infra::executor::domain_t::feature_worker;
-            sub.priority = 3;
-            sub.body = [ctx, cont_admission_ptr, cont_token]() {
-            run_crawl(ctx);
-            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed phase=continuation",
-                static_cast<unsigned long long>(ctx->id),
-                static_cast<unsigned long long>(cont_token));
-            cont_admission_ptr->release("completed");
-        };
-            return ::aida::infra::executor::submit(std::move(sub)).submitted;
-        }()) {
-            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=executor_unavailable phase=continuation",
-                static_cast<unsigned long long>(c.id),
-                static_cast<unsigned long long>(cont_token));
-        }
-    }
+    if (ctx->finished.load(std::memory_order_acquire)) return false;
+    return schedule_crawl(ctx, std::move(admission), "continuation", std::chrono::milliseconds(0));
 }
 
-void run_crawl(std::shared_ptr<crawl_t> ctx)
+bool run_crawl(std::shared_ptr<crawl_t> ctx, admission_ptr_t admission)
 {
     auto& c = *ctx;
-    if (c.finished.load()) return;
+    if (c.finished.load()) return false;
     if (c.stop_flag.load())
     {
         std::lock_guard<std::mutex> lk(c.mtx);
@@ -726,78 +755,27 @@ void run_crawl(std::shared_ptr<crawl_t> ctx)
         {
             next = std::move(c.queue.front());
             c.queue.pop_front();
+            c.in_flight.fetch_add(1, std::memory_order_acq_rel);
             has = true;
         }
     }
     if (has)
     {
-        worker_step(ctx, next);
-        return;
+        return worker_step(ctx, next, std::move(admission));
     }
 
     if (ctx->in_flight.load() == 0)
     {
-        bool already = false;
-        {
-            std::lock_guard<std::mutex> lk(c.mtx);
-            if (c.phase == crawl_status_phase_t::complete) already = true;
-            else
-            {
-                c.phase = c.stop_flag.load() ? crawl_status_phase_t::complete : crawl_status_phase_t::complete;
-                c.finished_unix_ms = now_ms();
-                c.last_progress_unix_ms = c.finished_unix_ms;
-            }
-        }
-        if (!already)
-        {
-            c.finished.store(true);
+        const bool cancelled = c.stop_flag.load(std::memory_order_acquire);
+        if (terminalize(ctx, crawl_status_phase_t::complete,
+                cancelled ? "cancelled" : std::string(), cancelled)) {
             diag::log_tagged_fmt("burp.crawler", "crawl_finished id=%llu visited=%d failed=%d found=%d",
                 static_cast<unsigned long long>(c.id), c.pages_visited, c.pages_failed, static_cast<int>(c.discovered.size()));
         }
-        return;
+        return false;
     }
 
-    {
-        mcp_standalone::downstream::producer_identity_t wait_id;
-        wait_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
-        wait_id.tool_name = "crawler.run_crawl_wait";
-        wait_id.domain = c.config.start_urls.empty() ? std::string() : c.config.start_urls.front();
-        auto wait_admission = mcp_standalone::downstream::scoped_admission_t::acquire(wait_id);
-        if (!wait_admission.active()) {
-            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-REJECT id=%llu reason=%s quota=%s observed=%zu limit=%zu phase=wait",
-                static_cast<unsigned long long>(c.id),
-                wait_admission.result().reason.c_str(),
-                wait_admission.result().quota_name.c_str(),
-                wait_admission.result().observed, wait_admission.result().limit);
-            return;
-        }
-        const uint64_t wait_token = wait_admission.token();
-        diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-ADMIT id=%llu token=%llu phase=wait",
-            static_cast<unsigned long long>(c.id),
-            static_cast<unsigned long long>(wait_token));
-        auto wait_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(wait_admission));
-        if (![&]() {
-            ::aida::infra::executor::submission_t sub;
-            sub.owner_subsystem = "burp.crawler";
-            sub.label = "crawler.wait";
-            sub.thread_class = "bounded_task";
-            sub.domain = aida::infra::executor::domain_t::feature_worker;
-            sub.priority = 3;
-            sub.body = [ctx, wait_admission_ptr, wait_token]() {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            run_crawl(ctx);
-            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed phase=wait",
-                static_cast<unsigned long long>(ctx->id),
-                static_cast<unsigned long long>(wait_token));
-            wait_admission_ptr->release("completed");
-        };
-            return ::aida::infra::executor::submit(std::move(sub)).submitted;
-        }()) {
-            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=executor_unavailable phase=wait",
-                static_cast<unsigned long long>(c.id),
-                static_cast<unsigned long long>(wait_token));
-        }
-    }
+    return schedule_crawl(ctx, std::move(admission), "wait", std::chrono::milliseconds(50));
 }
 
 }
@@ -875,6 +853,7 @@ uint64_t start(const crawl_config_t& config)
         static_cast<unsigned long long>(ctx->id), config.start_urls.size(), config.max_depth, config.max_pages);
 
     int kick = std::max(1, std::min(config.concurrency, 32));
+    int posted_kicks = 0;
     for (int i = 0; i < kick; ++i) {
         mcp_standalone::downstream::producer_identity_t kick_id;
         kick_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
@@ -894,7 +873,7 @@ uint64_t start(const crawl_config_t& config)
             static_cast<unsigned long long>(ctx->id),
             static_cast<unsigned long long>(kick_token));
         auto kick_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(kick_admission));
-        if (![&]() {
+        if ([&]() {
             ::aida::infra::executor::submission_t sub;
             sub.owner_subsystem = "burp.crawler";
             sub.label = "crawler.kick";
@@ -902,18 +881,30 @@ uint64_t start(const crawl_config_t& config)
             sub.domain = aida::infra::executor::domain_t::feature_worker;
             sub.priority = 3;
             sub.body = [ctx, kick_admission_ptr, kick_token]() {
-            run_crawl(ctx);
-            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed phase=kick",
-                static_cast<unsigned long long>(ctx->id),
-                static_cast<unsigned long long>(kick_token));
-            kick_admission_ptr->release("completed");
+            const bool transferred = run_crawl(ctx, kick_admission_ptr);
+            if (!transferred) {
+                diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed phase=kick",
+                    static_cast<unsigned long long>(ctx->id),
+                    static_cast<unsigned long long>(kick_token));
+                kick_admission_ptr->release("completed");
+            }
         };
             return ::aida::infra::executor::submit(std::move(sub)).submitted;
         }()) {
+            ++posted_kicks;
+        } else {
             diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=executor_unavailable phase=kick",
                 static_cast<unsigned long long>(ctx->id),
                 static_cast<unsigned long long>(kick_token));
         }
+    }
+    if (posted_kicks == 0) {
+        const std::string error = "crawler worker admission or submission rejected";
+        terminalize(ctx, crawl_status_phase_t::error, error, false);
+        set_err(error);
+        std::lock_guard<std::mutex> lk(reg().mtx);
+        reg().by_id.erase(ctx->id);
+        return 0;
     }
     return ctx->id;
 }
@@ -937,6 +928,8 @@ bool stop(uint64_t crawl_id)
         std::lock_guard<std::mutex> lk(ctx->mtx);
         if (ctx->phase == crawl_status_phase_t::running) ctx->phase = crawl_status_phase_t::stopping;
     }
+    if (ctx->in_flight.load(std::memory_order_acquire) == 0)
+        terminalize(ctx, crawl_status_phase_t::complete, "cancelled", true);
     diag::log_tagged_fmt("burp.crawler", "crawl_stop id=%llu", static_cast<unsigned long long>(crawl_id));
     return true;
 }
@@ -962,6 +955,9 @@ crawl_status_t status(uint64_t crawl_id)
     out.finished_unix_ms = ctx->finished_unix_ms;
     out.last_progress_unix_ms = ctx->last_progress_unix_ms;
     out.in_flight = ctx->in_flight.load();
+    out.finished = ctx->finished.load(std::memory_order_acquire);
+    out.cancelled = out.finished && ctx->stop_flag.load(std::memory_order_acquire) &&
+        ctx->phase == crawl_status_phase_t::complete;
     const uint64_t elapsed_end = ctx->finished_unix_ms != 0 ? ctx->finished_unix_ms : now_ms();
     const uint64_t elapsed_ms = elapsed_end > ctx->started_unix_ms ? elapsed_end - ctx->started_unix_ms : 0;
     out.pages_per_sec = elapsed_ms > 0 ? (static_cast<double>(ctx->pages_visited) * 1000.0) / static_cast<double>(elapsed_ms) : 0.0;

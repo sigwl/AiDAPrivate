@@ -563,7 +563,9 @@ inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
 		sub.thread_class = "bounded_task";
 		sub.domain = aida::infra::executor::domain_t::feature_worker;
 		sub.priority = 2;
-		sub.body = [entry_address, workspace_context]() {
+		const uint32_t target_pid = driver_bridge::attached_pid();
+		sub.target_pid = target_pid;
+		sub.body = [entry_address, workspace_context, target_pid]() {
 		try {
 		struct build_guard_t {
 			~build_guard_t()
@@ -588,8 +590,8 @@ inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
 					have_data = !mem.empty();
 				}
 			}
-		} else if (driver_bridge::attached_pid() != 0) {
-			have_data = driver_bridge::read_memory(entry_address, max_bytes, mem);
+		} else if (target_pid != 0) {
+			have_data = driver_bridge::read_memory_for(target_pid, entry_address, max_bytes, mem);
 		}
 
 		if (mem.empty()) {

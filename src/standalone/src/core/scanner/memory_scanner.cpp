@@ -691,7 +691,7 @@ static void first_scan_thread(scan_config_t config,
 	}
 
 	auto t_start = std::chrono::steady_clock::now();
-	auto regions = driver_bridge::enumerate_memory_regions(4096);
+	auto regions = driver_bridge::enumerate_memory_regions_for(target_pid, 4096);
 	diag::log_tagged_fmt("mem_scanner", "first_scan_thread enter pid=%u regions=%zu val_type=%s mode=%s writable_only=%d exec_exclude=%d hex=%d align=%zu range=0x%llX+0x%llX",
 		driver_bridge::attached_pid(), regions.size(),
 		value_type_name(config.value_type), scan_mode_name(config.scan_mode),
@@ -805,7 +805,8 @@ static void first_scan_thread(scan_config_t config,
 			return;
 		}
 		std::vector<uint8_t> buf;
-		if (!driver_bridge::read_memory(region.base, static_cast<size_t>(region.size), buf)) {
+		if (!driver_bridge::read_memory_for(target_pid, region.base, static_cast<size_t>(region.size), buf) ||
+			buf.size() != static_cast<size_t>(region.size)) {
 			size_t failures = read_failures.fetch_add(1, std::memory_order_acq_rel) + 1;
 			if (failures <= 16 || (failures % 256) == 0) {
 				diag::log_tagged_fmt("mem_scanner",
@@ -1399,8 +1400,10 @@ static void freeze_loop() {
 				static_cast<int>(identity_after_write), static_cast<int>(rollback_verified));
 			disable_entry();
 		}
-		if (!snapshot.empty()) Sleep(10);
-		else Sleep(100);
+		std::unique_lock<std::mutex> wait_lock(st.freeze_wait_mutex);
+		st.freeze_wait_cv.wait_for(wait_lock,
+			std::chrono::milliseconds(snapshot.empty() ? 100 : 10),
+			[&st]() { return !st.freeze_active.load(std::memory_order_acquire); });
 	}
 	diag::log_tagged("mem_scanner", "freeze_loop stop");
 }
@@ -1521,7 +1524,7 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 	}
 
 	auto modules = driver_bridge::enumerate_modules();
-	auto regions = driver_bridge::enumerate_memory_regions(4096);
+	auto regions = driver_bridge::enumerate_memory_regions_for(target_pid, 4096);
 
 	diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread enter target=0x%llX max_depth=%d max_offset=0x%X scan_range=0x%llX+0x%llX modules=%zu regions=%zu",
 		static_cast<unsigned long long>(target_address), max_depth, max_offset,
@@ -1595,7 +1598,8 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 						read_sz = static_cast<size_t>(region.size - off);
 
 					std::vector<uint8_t> buf;
-					if (!driver_bridge::read_memory(region.base + off, read_sz, buf)) {
+					if (!driver_bridge::read_memory_for(target_pid, region.base + off, read_sz, buf) ||
+						buf.size() != read_sz) {
 						bytes_scanned.fetch_add(read_sz);
 						st.pointer_progress.store(
 							static_cast<float>(bytes_scanned.load()) / static_cast<float>(total_bytes) * 0.5f);
@@ -1935,7 +1939,8 @@ void initialize() {
 		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(freeze_id);
 		diag::log_tagged_fmt("mem_scanner",
 			"FEATURE-WORKER-GROUP-REJECT freeze_loop reason=%s quota=%s observed=%zu limit=%zu",
-			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+			 rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		st.freeze_active.store(false, std::memory_order_release);
 		st.freeze_thread_done.store(true, std::memory_order_release);
 		return;
 	}
@@ -1954,19 +1959,31 @@ void initialize() {
 			freeze_loop();
 			g_state.freeze_thread_done.store(true, std::memory_order_release);
 		};
-	if (!aida::infra::executor::submit(std::move(freeze_sub)).submitted)
+	const auto freeze_submission = aida::infra::executor::submit(std::move(freeze_sub));
+	if (!freeze_submission.submitted)
 	{
-		diag::log_tagged("mem_scanner", "initialize freeze_loop_post_failed");
+		diag::log_tagged_fmt("mem_scanner", "initialize freeze_loop_post_failed reason=%s",
+			freeze_submission.reject_reason.empty() ? "unknown" : freeze_submission.reject_reason.c_str());
+		st.freeze_active.store(false, std::memory_order_release);
 		st.freeze_thread_done.store(true, std::memory_order_release);
 	}
 	diag::log_tagged_fmt("mem_scanner",
-		"FEATURE-WORKER-GROUP-RELEASE freeze_loop token=%llu reason=dispatched",
-		static_cast<unsigned long long>(freeze_admission.token()));
-	freeze_admission.release("dispatched");
+		"FEATURE-WORKER-GROUP-RELEASE freeze_loop token=%llu reason=%s",
+		static_cast<unsigned long long>(freeze_admission.token()),
+		freeze_submission.submitted ? "dispatched" : "submission_rejected");
+	freeze_admission.release(freeze_submission.submitted ? "dispatched" : "submission_rejected");
 }
 
 void shutdown() {
-	diag::log_tagged("mem_scanner", "shutdown enter");
+	const uint64_t started = GetTickCount64();
+	diag::log_tagged_fmt("mem_scanner",
+		"shutdown enter scanning=%d pointer_scanning=%d freeze_active=%d scan_done=%d pointer_done=%d freeze_done=%d",
+		g_state.scanning.load(std::memory_order_acquire) ? 1 : 0,
+		g_state.pointer_scanning.load(std::memory_order_acquire) ? 1 : 0,
+		g_state.freeze_active.load(std::memory_order_acquire) ? 1 : 0,
+		g_state.scan_thread_done.load(std::memory_order_acquire) ? 1 : 0,
+		g_state.pointer_thread_done.load(std::memory_order_acquire) ? 1 : 0,
+		g_state.freeze_thread_done.load(std::memory_order_acquire) ? 1 : 0);
 	persist_scanner_state();
 	auto& st = g_state;
 	{
@@ -1977,15 +1994,26 @@ void shutdown() {
 	st.scanning.store(false);
 	st.pointer_scanning.store(false);
 	st.freeze_active.store(false);
+	st.freeze_wait_cv.notify_all();
 	for (int i = 0; i < 100 && (st.scanning.load() || st.pointer_scanning.load()); ++i)
 		Sleep(20);
-	while (!st.scan_thread_done.load(std::memory_order_acquire))
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
-	while (!st.pointer_thread_done.load(std::memory_order_acquire))
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
-	while (!st.freeze_thread_done.load(std::memory_order_acquire))
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
-	diag::log_tagged("mem_scanner", "shutdown done");
+	auto wait_done = [&](const char* worker, const std::atomic<bool>& done) {
+		const uint64_t wait_started = GetTickCount64();
+		while (!done.load(std::memory_order_acquire) && GetTickCount64() - wait_started < 10000)
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		diag::log_tagged_fmt("mem_scanner", "shutdown worker=%s drained=%d elapsed_ms=%llu",
+			worker, done.load(std::memory_order_acquire) ? 1 : 0,
+			static_cast<unsigned long long>(GetTickCount64() - wait_started));
+	};
+	wait_done("scan", st.scan_thread_done);
+	wait_done("pointer", st.pointer_thread_done);
+	wait_done("freeze", st.freeze_thread_done);
+	diag::log_tagged_fmt("mem_scanner",
+		"shutdown done elapsed_ms=%llu scan_done=%d pointer_done=%d freeze_done=%d",
+		static_cast<unsigned long long>(GetTickCount64() - started),
+		st.scan_thread_done.load(std::memory_order_acquire) ? 1 : 0,
+		st.pointer_thread_done.load(std::memory_order_acquire) ? 1 : 0,
+		st.freeze_thread_done.load(std::memory_order_acquire) ? 1 : 0);
 }
 
 bool first_scan(const scan_config_t& config) {

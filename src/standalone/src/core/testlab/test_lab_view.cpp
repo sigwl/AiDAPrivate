@@ -8,6 +8,7 @@
 #include "imgui/imgui_internal.h"
 
 #include "../infra/executor.hpp"
+#include "../runtime/standalone_driver.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/ui_anim.hpp"
 #include "../ui/empty_state.hpp"
@@ -255,6 +256,7 @@ namespace test_lab_view {
 		}
 
 		std::atomic<bool> g_run_all_active{ false };
+		std::atomic<bool> g_single_feature_active{ false };
 		std::atomic<int>  g_run_all_current{ 0 };
 		std::atomic<int>  g_run_all_total{ 0 };
 		std::atomic<int>  g_run_all_ok{ 0 };
@@ -263,6 +265,11 @@ namespace test_lab_view {
 		std::mutex        g_run_all_status_mtx;
 		std::string       g_run_all_status_line;
 		std::string       g_run_all_current_name;
+
+		struct run_all_control_t {
+			std::atomic<bool> cancel_requested{ false };
+			std::atomic<int> ownership{ 0 };
+		};
 
 		struct log_tail_line_t {
 			std::uint64_t index = 0;
@@ -725,6 +732,7 @@ namespace test_lab_view {
 			std::uint64_t dtb = 0;
 			std::uint64_t base = 0;
 			std::uint64_t alloc_addr = 0;
+			std::uint32_t alloc_pid = 0;
 			bool sandbox_self_registered = false;
 		};
 
@@ -738,21 +746,40 @@ namespace test_lab_view {
 			cache.dtb = 0;
 			cache.base = 0;
 			cache.alloc_addr = 0;
+			cache.alloc_pid = 0;
 			cache.sandbox_self_registered = false;
 			if (!device || !device->is_connected()) return;
 			std::uint32_t self_pid = static_cast<std::uint32_t>(GetCurrentProcessId());
-			device->set_process_id(self_pid);
-			device->solve_dtb();
-			cache.dtb = device->get_dtb();
-			cache.base = device->get_base_address();
-			std::uint64_t alloc_va = device->allocate_memory(0x1000);
-			if (alloc_va != 0) cache.alloc_addr = alloc_va;
+			cache.dtb = device->solve_dtb_for_pid(self_pid);
+			HMODULE self_module = GetModuleHandleW(nullptr);
+			if (self_module != nullptr)
+				cache.base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(self_module));
+			cache.alloc_addr = driver_bridge::allocate_memory_for(self_pid, 0x1000);
+			if (cache.alloc_addr != 0) cache.alloc_pid = self_pid;
 			diag::log_tagged_fmt("testlab",
 				"run-all cache primed: pid=%u dtb=0x%016llX base=0x%016llX alloc_addr=0x%016llX",
 				static_cast<unsigned>(self_pid),
 				static_cast<unsigned long long>(cache.dtb),
 				static_cast<unsigned long long>(cache.base),
 				static_cast<unsigned long long>(cache.alloc_addr));
+		}
+
+		void release_run_all_cache(run_all_cache_t& cache) noexcept {
+			try {
+				if (cache.alloc_addr != 0) {
+					if (!driver_bridge::free_memory_for(cache.alloc_pid, cache.alloc_addr)) {
+						diag::log_tagged_fmt("testlab", "run-all cache free failed: addr=0x%016llX pid=%u",
+							static_cast<unsigned long long>(cache.alloc_addr),
+							static_cast<unsigned>(cache.alloc_pid));
+					}
+					cache.alloc_addr = 0;
+					cache.alloc_pid = 0;
+				}
+			} catch (...) {
+				diag::log_tagged("testlab", "run-all cache cleanup exception");
+				cache.alloc_addr = 0;
+				cache.alloc_pid = 0;
+			}
 		}
 
 		void apply_smart_defaults(const test_lab::feature_t& f,
@@ -869,6 +896,10 @@ namespace test_lab_view {
 		}
 
 		void start_run_all_safe() {
+			if (g_single_feature_active.load(std::memory_order_acquire)) {
+				diag::log_tagged("test_lab", "run_all_safe rejected: single feature worker still active");
+				return;
+			}
 			bool expected = false;
 			if (!g_run_all_active.compare_exchange_strong(expected, true)) return;
 			g_run_all_current.store(0);
@@ -888,19 +919,44 @@ namespace test_lab_view {
 
 			bool posted = false;
 			try {
+				auto control = std::make_shared<run_all_control_t>();
 				aida::infra::executor::submission_t submission;
 				submission.owner_subsystem = "test_lab_view";
 				submission.label = "test_lab_view.run_all_safe";
 				submission.thread_class = "testlab_view_run_all";
 				submission.domain = aida::infra::executor::domain_t::long_running;
 				submission.priority = 2;
+				submission.cancel_hook = [control]() {
+					control->cancel_requested.store(true, std::memory_order_release);
+					int queued = 0;
+					if (control->ownership.compare_exchange_strong(queued, 2, std::memory_order_acq_rel)) {
+						g_run_all_active.store(false, std::memory_order_release);
+						std::lock_guard<std::mutex> lk(g_run_all_status_mtx);
+						g_run_all_status_line = "cancelled before worker start";
+						g_run_all_current_name.clear();
+					}
+				};
 				submission.failure_policy = "reject_not_started";
-				submission.body = []() {
+				submission.body = [control]() {
+				int queued = 0;
+				if (!control->ownership.compare_exchange_strong(queued, 1, std::memory_order_acq_rel))
+					return;
+				struct active_reset_t {
+					std::shared_ptr<run_all_control_t> control;
+					~active_reset_t() {
+						control->ownership.store(2, std::memory_order_release);
+						g_run_all_active.store(false, std::memory_order_release);
+					}
+				} active_reset{ control };
+				HANDLE hFile = INVALID_HANDLE_VALUE;
+				run_all_cache_t cache;
+				std::size_t active_feature = static_cast<std::size_t>(-1);
+				try {
 				full_test_scope_t full_test_scope("test_lab_view_run_all");
 				const auto& features = test_lab::all_features();
 				g_run_all_total.store(static_cast<int>(features.size()));
 
-				HANDLE hFile = open_log_for_append();
+				hFile = open_log_for_append();
 				if (hFile != INVALID_HANDLE_VALUE) {
 					char ts[40];
 					format_local_timestamp(ts, sizeof(ts));
@@ -913,17 +969,18 @@ namespace test_lab_view {
 					append_log_line(hFile, std::string(header), true);
 				}
 
-				run_all_cache_t cache;
 				prime_run_all_cache(cache);
 
 				for (std::size_t i = 0; i < features.size(); ++i) {
+					if (control->cancel_requested.load(std::memory_order_acquire))
+						break;
+					active_feature = i;
 					const auto& f = features[i];
 					g_run_all_current.store(static_cast<int>(i + 1));
 					{
 						std::lock_guard<std::mutex> lk(g_run_all_status_mtx);
 						g_run_all_current_name = (f.name != nullptr ? f.name : "?");
 					}
-					update_feature_summary_start(i, 0);
 
 					const char* destructive_reason = test_lab::destructive_guard_reason(f.category, f.name);
 					if (destructive_reason != nullptr) {
@@ -932,6 +989,7 @@ namespace test_lab_view {
 						std::uint64_t log_index = append_log_skip(hFile, f, reason.c_str());
 						update_feature_summary_skip(i, reason.c_str(), log_index);
 						test_lab_format::testlab_diag_log_skip(f, reason.c_str());
+						active_feature = static_cast<std::size_t>(-1);
 						continue;
 					}
 					if (f.run == nullptr) {
@@ -939,12 +997,17 @@ namespace test_lab_view {
 						std::uint64_t log_index = append_log_skip(hFile, f, "no run function");
 						update_feature_summary_skip(i, "no run function", log_index);
 						test_lab_format::testlab_diag_log_skip(f, "no run function");
+						active_feature = static_cast<std::size_t>(-1);
 						continue;
 					}
 
 					test_lab::state_t s;
 					populate_safe_defaults(s);
 					apply_smart_defaults(f, s, cache);
+					if (control->cancel_requested.load(std::memory_order_acquire)) {
+						active_feature = static_cast<std::size_t>(-1);
+						break;
+					}
 					test_lab::result_t r;
 					std::uint64_t start_log_index = append_log_starting(hFile, f, s);
 					update_feature_summary_start(i, start_log_index);
@@ -964,16 +1027,22 @@ namespace test_lab_view {
 					std::uint64_t result_log_index = append_log_result(hFile, f, s, r, r.elapsed_us);
 					update_feature_summary_result(i, r, result_log_index);
 					test_lab_format::testlab_diag_log_exit(f, r, r.elapsed_us);
+					active_feature = static_cast<std::size_t>(-1);
+					if (control->cancel_requested.load(std::memory_order_acquire))
+						break;
 				}
+				active_feature = static_cast<std::size_t>(-1);
+				const bool cancelled = control->cancel_requested.load(std::memory_order_acquire);
 
 				if (hFile != INVALID_HANDLE_VALUE) {
 					char ts2[40];
 					format_local_timestamp(ts2, sizeof(ts2));
 					char footer[256];
 					std::snprintf(footer, sizeof(footer),
-						"[%s] Run All complete: ok=%d fail=%d skipped=%d total=%d\n"
+						"[%s] Run All %s: ok=%d fail=%d skipped=%d total=%d\n"
 						"========================================\n\n",
 						ts2,
+						cancelled ? "cancelled" : "complete",
 						g_run_all_ok.load(),
 						g_run_all_fail.load(),
 						g_run_all_skipped.load(),
@@ -981,20 +1050,67 @@ namespace test_lab_view {
 					append_log_line(hFile, std::string(footer), true);
 					flush_run_all_log(hFile);
 					CloseHandle(hFile);
+					hFile = INVALID_HANDLE_VALUE;
 				}
 
 				{
 					std::lock_guard<std::mutex> lk(g_run_all_status_mtx);
 					char buf[160];
 					std::snprintf(buf, sizeof(buf),
-						"done: ok=%d fail=%d skipped=%d (log on Desktop)",
+						cancelled ? "cancelled: ok=%d fail=%d skipped=%d (log on Desktop)" :
+							"done: ok=%d fail=%d skipped=%d (log on Desktop)",
 						g_run_all_ok.load(),
 						g_run_all_fail.load(),
 						g_run_all_skipped.load());
 					g_run_all_status_line = buf;
 					g_run_all_current_name.clear();
 				}
-				g_run_all_active.store(false);
+				release_run_all_cache(cache);
+				if (hFile != INVALID_HANDLE_VALUE) {
+					CloseHandle(hFile);
+					hFile = INVALID_HANDLE_VALUE;
+				}
+				} catch (const std::exception& ex) {
+					release_run_all_cache(cache);
+					if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+					if (active_feature != static_cast<std::size_t>(-1)) {
+						const auto& features = test_lab::all_features();
+						if (active_feature < features.size()) {
+							test_lab::result_t failure;
+							failure.outcome = test_lab::outcome_e::failed;
+							failure.error = ex.what();
+							failure.state.store(test_lab::run_state_e::complete, std::memory_order_release);
+							update_feature_summary_result(active_feature, failure, 0);
+						}
+					}
+					g_run_all_fail.fetch_add(1);
+					{
+						std::lock_guard<std::mutex> lk(g_run_all_status_mtx);
+						g_run_all_status_line = "failed: worker exception";
+						g_run_all_current_name.clear();
+					}
+					diag::log_tagged_fmt("test_lab", "run_all_safe worker exception: %s", ex.what());
+				} catch (...) {
+					release_run_all_cache(cache);
+					if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+					if (active_feature != static_cast<std::size_t>(-1)) {
+						const auto& features = test_lab::all_features();
+						if (active_feature < features.size()) {
+							test_lab::result_t failure;
+							failure.outcome = test_lab::outcome_e::failed;
+							failure.error = "unknown worker exception";
+							failure.state.store(test_lab::run_state_e::complete, std::memory_order_release);
+							update_feature_summary_result(active_feature, failure, 0);
+						}
+					}
+					g_run_all_fail.fetch_add(1);
+					{
+						std::lock_guard<std::mutex> lk(g_run_all_status_mtx);
+						g_run_all_status_line = "failed: worker exception";
+						g_run_all_current_name.clear();
+					}
+					diag::log_tagged("test_lab", "run_all_safe worker unknown exception");
+				}
 				};
 				posted = aida::infra::executor::submit(std::move(submission)).submitted;
 			} catch (const std::exception& ex) {
@@ -1218,7 +1334,9 @@ namespace test_lab_view {
 
 				if (clicked && fidx != g_selected_idx) {
 					g_selected_idx = fidx;
-					try_replace_result("left_pane_select_reset", std::make_shared<test_lab::result_t>());
+					if (!g_single_feature_active.load(std::memory_order_acquire) &&
+						!g_run_all_active.load(std::memory_order_acquire))
+						try_replace_result("left_pane_select_reset", std::make_shared<test_lab::result_t>());
 				}
 				if (hov) {
 					ImGui::BeginTooltip();
@@ -1279,15 +1397,27 @@ namespace test_lab_view {
 			ImGui::SameLine();
 
 			if (ImGui::Button("Clear", ImVec2(110.f, 28.f))) {
-				try_replace_result("action_row_clear", std::make_shared<test_lab::result_t>());
+				if (!g_single_feature_active.load(std::memory_order_acquire) &&
+					!g_run_all_active.load(std::memory_order_acquire))
+					try_replace_result("action_row_clear", std::make_shared<test_lab::result_t>());
 			}
 		}
 
 		void run_fn_post_with_feature(const test_lab::feature_t& f, int feature_idx) {
+			if (g_run_all_active.load(std::memory_order_acquire)) {
+				diag::log_tagged("test_lab", "single feature rejected: run-all worker still active");
+				return;
+			}
+			bool expected_active = false;
+			if (!g_single_feature_active.compare_exchange_strong(expected_active, true, std::memory_order_acq_rel)) {
+				diag::log_tagged("test_lab", "single feature rejected: previous worker still active");
+				return;
+			}
 			test_lab::state_t snapshot = g_state;
 			std::shared_ptr<test_lab::result_t> new_result = std::make_shared<test_lab::result_t>();
 			new_result->state.store(test_lab::run_state_e::running, std::memory_order_release);
 			if (!try_replace_result("single_feature_start", new_result)) {
+				g_single_feature_active.store(false, std::memory_order_release);
 				new_result->ok = false;
 				new_result->outcome = test_lab::outcome_e::failed;
 				new_result->error = "result lock busy";
@@ -1308,6 +1438,10 @@ namespace test_lab_view {
 			submission.diagnostic_id = feature_copy.name ? feature_copy.name : "unnamed";
 			submission.failure_policy = "reject_not_started";
 			submission.body = [feature_copy, snapshot, new_result, feature_idx]() mutable {
+				struct active_reset_t {
+					~active_reset_t() { g_single_feature_active.store(false, std::memory_order_release); }
+				} active_reset;
+				try {
 				full_test_scope_t full_test_scope("test_lab_view_single_feature");
 				if (feature_copy.run == nullptr) {
 					new_result->ok = false;
@@ -1345,11 +1479,51 @@ namespace test_lab_view {
 				new_result->state.store(test_lab::run_state_e::complete, std::memory_order_release);
 				if (feature_idx >= 0)
 					update_feature_summary_result(static_cast<std::size_t>(feature_idx), *new_result, 0);
+				} catch (const std::exception& ex) {
+					{
+						std::lock_guard<std::mutex> lk(g_result_mtx);
+						new_result->ok = false;
+						new_result->outcome = test_lab::outcome_e::failed;
+						new_result->skipped = false;
+						new_result->error = ex.what();
+					}
+					new_result->state.store(test_lab::run_state_e::complete, std::memory_order_release);
+					if (feature_idx >= 0)
+						update_feature_summary_result(static_cast<std::size_t>(feature_idx), *new_result, 0);
+					diag::log_tagged_fmt("test_lab", "single_feature worker exception name=%s: %s",
+						feature_copy.name ? feature_copy.name : "?", ex.what());
+				} catch (...) {
+					{
+						std::lock_guard<std::mutex> lk(g_result_mtx);
+						new_result->ok = false;
+						new_result->outcome = test_lab::outcome_e::failed;
+						new_result->skipped = false;
+						new_result->error = "unknown worker exception";
+					}
+					new_result->state.store(test_lab::run_state_e::complete, std::memory_order_release);
+					if (feature_idx >= 0)
+						update_feature_summary_result(static_cast<std::size_t>(feature_idx), *new_result, 0);
+					diag::log_tagged_fmt("test_lab", "single_feature worker unknown exception name=%s",
+						feature_copy.name ? feature_copy.name : "?");
+				}
 			};
-			if (!aida::infra::executor::submit(std::move(submission)).submitted) {
+			bool submitted = false;
+			try {
+				submitted = aida::infra::executor::submit(std::move(submission)).submitted;
+			} catch (const std::exception& ex) {
+				new_result->error = ex.what();
+				diag::log_tagged_fmt("test_lab", "single_feature executor submit exception name=%s: %s",
+					feature_copy.name ? feature_copy.name : "?", ex.what());
+			} catch (...) {
+				new_result->error = "executor submission exception";
+				diag::log_tagged_fmt("test_lab", "single_feature executor submit unknown exception name=%s",
+					feature_copy.name ? feature_copy.name : "?");
+			}
+			if (!submitted) {
+				g_single_feature_active.store(false, std::memory_order_release);
 				new_result->ok = false;
 				new_result->outcome = test_lab::outcome_e::failed;
-				new_result->error = "executor unavailable";
+				if (new_result->error.empty()) new_result->error = "executor unavailable";
 				new_result->state.store(test_lab::run_state_e::complete, std::memory_order_release);
 				if (feature_idx >= 0)
 					update_feature_summary_result(static_cast<std::size_t>(feature_idx), *new_result, 0);

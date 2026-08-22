@@ -84,9 +84,7 @@ models.json
 **/background.c
 
 # Excluded Project Roots
-/bot/
 /camoufox-reverse-mcp/
-/firebase/
 /ida-sdk/
 /libdecomp/
 /libs/
@@ -101,3 +99,6 @@ models.json
 /win11_24h2_afd.md
 /win11_25h2_afd.md
 .aider*
+
+# Local OpenCode orchestration state
+.slim/deepwork/

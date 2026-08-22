@@ -8,7 +8,8 @@ param(
     [switch]$PlanOnly,
     [switch]$NoToast,
     [string]$Preset = "ninja-msvc-release",
-    [string]$VsVars = ""
+    [string]$VsVars = "",
+    [string]$OpenSslRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -56,7 +57,34 @@ function Resolve-VsVarsPath {
     throw "vcvars64.bat was not found. Checked: $($candidates -join '; ')"
 }
 
-$VsVars = Resolve-VsVarsPath $VsVars
+function Resolve-NinjaPath {
+    param([string]$ResolvedVsVars)
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $pathNinja = Get-Command ninja.exe -ErrorAction SilentlyContinue
+    if ($pathNinja) {
+        $candidates.Add($pathNinja.Source)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ResolvedVsVars)) {
+        $vsRoot = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $ResolvedVsVars) "..\..\.."))
+        $candidates.Add((Join-Path $vsRoot "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"))
+    }
+    $editions = @("Professional", "Community", "Enterprise", "BuildTools")
+    foreach ($edition in $editions) {
+        $candidates.Add("C:\Program Files\Microsoft Visual Studio\2022\$edition\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe")
+        $candidates.Add("C:\Program Files (x86)\Microsoft Visual Studio\2022\$edition\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe")
+    }
+    foreach ($candidate in $candidates) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -LiteralPath $candidate)) {
+            return $candidate
+        }
+    }
+    throw "ninja.exe was not found. Install the Visual Studio CMake tools component or add Ninja to PATH."
+}
+
+if (-not $PlanOnly) {
+    $VsVars = Resolve-VsVarsPath $VsVars
+    $NinjaPath = Resolve-NinjaPath $VsVars
+}
 
 if ($CleanBuildTree) {
     $Configure = $true
@@ -137,6 +165,86 @@ function Clear-AidaBuildTree {
         Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] REMOVE $resolvedBuild"
         Remove-Item -LiteralPath $resolvedBuild -Recurse -Force
     }
+}
+
+function Assert-AidaBuildPrerequisites {
+    $requiredPaths = @(
+        ".deps\zydis-4.1.1\CMakeLists.txt",
+        ".deps\sqlite-amalgamation-3530300\sqlite3.c",
+        ".deps\taskflow\taskflow\taskflow.hpp",
+        ".deps\zlib\CMakeLists.txt",
+        ".deps\capstone\capstone-5.0.9\CMakeLists.txt",
+        ".deps\json-schema-validator-2.4.0\CMakeLists.txt",
+        ".deps\zstd-1.5.7\build\cmake\CMakeLists.txt",
+        ".deps\xz-5.8.3\CMakeLists.txt",
+        ".deps\pcre2-10.47\CMakeLists.txt",
+        ".deps\parallel-hashmap-2.0.0\parallel-hashmap-2.0.0\parallel_hashmap\phmap.h",
+        ".deps\concurrentqueue-1.0.5\concurrentqueue-1.0.5\concurrentqueue.h",
+        ".deps\unicorn\CMakeLists.txt",
+        ".deps\brotli\CMakeLists.txt",
+        ".deps\llhttp\CMakeLists.txt",
+        ".deps\nghttp2\CMakeLists.txt",
+        ".deps\lua-lua-a5522f0\lua.h",
+        ".deps\sol2\CMakeLists.txt",
+        ".deps\z3\z3-4.13.4-x64-win\include\z3.h",
+        ".deps\z3\z3-4.13.4-x64-win\bin\libz3.lib",
+        ".deps\z3\z3-4.13.4-x64-win\bin\libz3.dll",
+        ".deps\MemPDB\CMakeLists.txt",
+        ".deps\mimalloc\CMakeLists.txt",
+        ".deps\imgui-src\imgui.cpp",
+        "sources\Triton\CMakeLists.txt",
+        "sources\ghidra\Ghidra\Features\Decompiler\src\decompile\cpp\architecture.cc"
+    )
+    $missing = @($requiredPaths | Where-Object {
+        -not (Test-Path -LiteralPath (Join-Path $Root $_))
+    })
+    $requiredAlternatives = @(
+        @(".deps\camoufox-reverse-mcp\pyproject.toml", "camoufox-reverse-mcp\pyproject.toml"),
+        @(".deps\camoufox-135.0.1-beta.24-win.x86_64\camoufox.exe", "camoufox-135.0.1-beta.24-win.x86_64\camoufox.exe"),
+        @(".deps\camoufox-runtime\python.exe", ".deps\camoufox-python\python.exe", ".deps\python-3.12\python.exe", ".deps\python-3.12.10-x64\python.exe", "camoufox-runtime\python.exe", "camoufox-python\python.exe", "runtime\python\python.exe")
+    )
+    foreach ($alternatives in $requiredAlternatives) {
+        $found = $false
+        foreach ($relativePath in $alternatives) {
+            if (Test-Path -LiteralPath (Join-Path $Root $relativePath)) {
+                $found = $true
+                break
+            }
+        }
+        if (-not $found) {
+            $missing += ($alternatives -join " or ")
+        }
+    }
+    $openSslFound = $false
+    $openSslCandidates = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($OpenSslRoot)) {
+        $openSslCandidates.Add($OpenSslRoot)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:OPENSSL_ROOT_DIR)) {
+        $openSslCandidates.Add($env:OPENSSL_ROOT_DIR)
+    }
+    $openSslCandidates.Add("C:\Program Files\OpenSSL-Win64")
+    $openSslCandidates.Add("C:\Program Files\OpenSSL")
+    $openSslCandidates.Add("C:\OpenSSL-Win64")
+    foreach ($candidate in $openSslCandidates) {
+        if ((Test-Path -LiteralPath (Join-Path $candidate "include\openssl\ssl.h")) -and
+            (Test-Path -LiteralPath (Join-Path $candidate "lib\VC\x64\MD\libssl_static.lib")) -and
+            (Test-Path -LiteralPath (Join-Path $candidate "lib\VC\x64\MD\libcrypto_static.lib")) -and
+            (Test-Path -LiteralPath (Join-Path $candidate "lib\VC\x64\MT\libssl_static.lib")) -and
+            (Test-Path -LiteralPath (Join-Path $candidate "lib\VC\x64\MT\libcrypto_static.lib"))) {
+            $script:OpenSslRoot = $candidate
+            $openSslFound = $true
+            break
+        }
+    }
+    if (-not $openSslFound) {
+        $missing += "OpenSSL headers and x64 MD/MT static libraries (set -OpenSslRoot or OPENSSL_ROOT_DIR)"
+    }
+    if ($missing.Count -eq 0) {
+        return
+    }
+    $details = ($missing | ForEach-Object { "  - $_" }) -join [Environment]::NewLine
+    throw "Required local build dependencies are missing. Restore the pinned dependency checkout before building; the wrapper has not removed build-ninja.$([Environment]::NewLine)$details"
 }
 
 function Send-AidaBuildNotification {
@@ -247,7 +355,15 @@ if ($Drivers) {
 }
 
 if ($Configure) {
-    $steps.Add((New-Step "configure" "cmake --preset $Preset" "configure.log" (Join-Path $env:TEMP "aida_configure_out.txt")))
+    $OpenSslConfigureArg = ""
+    if (-not [string]::IsNullOrWhiteSpace($OpenSslRoot)) {
+        $OpenSslConfigureArg = " -DOPENSSL_ROOT_DIR=`"$OpenSslRoot`""
+    }
+    $makeProgramArg = ""
+    if (-not [string]::IsNullOrWhiteSpace($NinjaPath)) {
+        $makeProgramArg = " -DCMAKE_MAKE_PROGRAM=`"$NinjaPath`""
+    }
+    $steps.Add((New-Step "configure" "cmake --preset $Preset$makeProgramArg$OpenSslConfigureArg" "configure.log" (Join-Path $env:TEMP "aida_configure_out.txt")))
 }
 
 if ($Drivers) {
@@ -277,6 +393,7 @@ if ($PlanOnly) {
 }
 
 try {
+    Assert-AidaBuildPrerequisites
     if ($CleanBuildTree) {
         Clear-AidaBuildTree
     }

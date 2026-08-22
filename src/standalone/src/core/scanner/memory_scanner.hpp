@@ -3,6 +3,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cctype>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -187,6 +188,8 @@ struct state_t {
 	std::atomic<uint32_t>              persisted_loaded_pid{0};
 	std::atomic<uint64_t>              persisted_loaded_creation_time_100ns{0};
 	std::atomic<bool>                  persisted_config_loaded{false};
+	std::mutex                         freeze_wait_mutex;
+	std::condition_variable            freeze_wait_cv;
 };
 
 inline state_t g_state;

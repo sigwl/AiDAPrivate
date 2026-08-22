@@ -2067,6 +2067,7 @@ inline void refresh_values() {
 
 	uint64_t base = 0;
 	uint32_t total_size = 0;
+	uint32_t target_pid = 0;
 	int active = -1;
 	std::size_t field_count = 0;
 	{
@@ -2094,6 +2095,7 @@ inline void refresh_values() {
 		}
 		base = g_state.base_address;
 		total_size = sd.total_size;
+		target_pid = driver_bridge::attached_pid();
 		field_count = sd.fields.size();
 	}
 
@@ -2105,14 +2107,16 @@ inline void refresh_values() {
 	sub.thread_class = "bounded_task";
 	sub.domain = aida::infra::executor::domain_t::diagnostics;
 	sub.priority = 4;
-	sub.body = [base, total_size, active, seq, field_count]() {
+	sub.target_pid = target_pid;
+	sub.body = [base, total_size, target_pid, active, seq, field_count]() {
 		std::vector<uint8_t> block;
-		bool ok = driver_bridge::read_memory(base, total_size, block);
-		if (!ok || block.empty()) {
+		bool ok = driver_bridge::read_memory_for(target_pid, base, total_size, block);
+		if (!ok || block.size() != total_size) {
 			g_state.refresh_in_flight.store(false);
 			diag::log_tagged_fmt("dissector",
-				"refresh_values_read_failed base=0x%llX size=%u",
-				static_cast<unsigned long long>(base), total_size);
+				"refresh_values_read_failed pid=%u base=0x%llX requested=%u returned=%zu",
+				 target_pid,
+				static_cast<unsigned long long>(base), total_size, block.size());
 			return;
 		}
 
@@ -2120,6 +2124,14 @@ inline void refresh_values() {
 		std::size_t oor_count = 0;
 		{
 			std::lock_guard<std::mutex> lk(g_state.mtx);
+			if (driver_bridge::attached_pid() != target_pid) {
+				g_state.refresh_in_flight.store(false);
+				diag::log_tagged_fmt("dissector",
+					"refresh_values_discarded pid=%u active_pid=%u seq=%llu",
+					target_pid, driver_bridge::attached_pid(),
+					static_cast<unsigned long long>(seq));
+				return;
+			}
 			if (!valid_index(active, g_state.structs.size())) {
 				g_state.refresh_in_flight.store(false);
 				return;

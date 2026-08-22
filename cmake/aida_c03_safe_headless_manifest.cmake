@@ -217,6 +217,7 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/infra/host_topology.cpp"
     "${STANDALONE_ROOT}/core/infra/allocator.cpp"
     "${STANDALONE_ROOT}/core/mcp/calculator_tool.cpp"
+    "${STANDALONE_ROOT}/core/mcp/calculator_engine.cpp"
     "${STANDALONE_ROOT}/core/mcp/ida_compat_mut.cpp"
     "${STANDALONE_ROOT}/core/mcp/ida_compat_read.cpp"
     "${STANDALONE_ROOT}/core/mcp/mcp_standalone.cpp"
@@ -464,6 +465,7 @@ set(AIDA_C03_COMPILER_MATRIX_CM_11
     "${STANDALONE_ROOT}/core/mcp/ida_compat_read.cpp"
     "${STANDALONE_ROOT}/core/mcp/ida_compat_mut.cpp"
     "${STANDALONE_ROOT}/core/mcp/calculator_tool.cpp"
+    "${STANDALONE_ROOT}/core/mcp/calculator_engine.cpp"
     "${STANDALONE_ROOT}/core/mcp/schema_validator.cpp"
     "${STANDALONE_ROOT}/core/mcp/mcp_standalone.cpp"
     "${STANDALONE_ROOT}/core/mcp/mcp_standalone_tools.cpp")

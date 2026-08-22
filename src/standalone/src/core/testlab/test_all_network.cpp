@@ -1,4 +1,5 @@
 #include "test_all_network.h"
+#include "test_lab_bounded_runner.hpp"
 
 #include "test_all_features.hpp"
 #include "../network/network_view.hpp"
@@ -35,7 +36,6 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
-#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -140,8 +140,6 @@ namespace {
                                            DWORD timeout_ms,
                                            Fn&& fn) {
         const ULONGLONG start = GetTickCount64();
-        auto promise = std::make_shared<std::promise<bounded_bool_result_t>>();
-        auto future = promise->get_future();
         log_msg(hf, tag, "BOUNDED-BEGIN -- op=%s timeout_ms=%lu host_pid=%lu host_tid=%lu",
             op, static_cast<unsigned long>(timeout_ms),
             static_cast<unsigned long>(GetCurrentProcessId()),
@@ -157,8 +155,8 @@ namespace {
             result.win32_error = GetLastError();
             const ULONGLONG now = GetTickCount64();
             result.elapsed_ms = static_cast<unsigned long long>(now >= start ? now - start : 0);
-            log_msg(hf, tag, "BOUNDED-TASK-INIT-FAIL -- op=%s gle=%lu elapsed_ms=%llu exception=%s",
-                op, static_cast<unsigned long>(result.win32_error), result.elapsed_ms, result.exception.c_str());
+            log_msg(hf, tag, "BOUNDED-TASK-INIT-FAIL -- op=%s gle=%lu elapsed_ms=%llu exception_len=%zu",
+                op, static_cast<unsigned long>(result.win32_error), result.elapsed_ms, result.exception.size());
             return result;
         } catch (...) {
             bounded_bool_result_t result;
@@ -167,76 +165,70 @@ namespace {
             result.win32_error = GetLastError();
             const ULONGLONG now = GetTickCount64();
             result.elapsed_ms = static_cast<unsigned long long>(now >= start ? now - start : 0);
-            log_msg(hf, tag, "BOUNDED-TASK-INIT-FAIL -- op=%s gle=%lu elapsed_ms=%llu exception=%s",
-                op, static_cast<unsigned long>(result.win32_error), result.elapsed_ms, result.exception.c_str());
+            log_msg(hf, tag, "BOUNDED-TASK-INIT-FAIL -- op=%s gle=%lu elapsed_ms=%llu exception_len=%zu",
+                op, static_cast<unsigned long>(result.win32_error), result.elapsed_ms, result.exception.size());
             return result;
         }
-        aida::infra::executor::submission_t sub;
-        sub.owner_subsystem = "testlab_network";
-        sub.label = op ? op : "testlab.network.bounded_bool";
-        sub.thread_class = "bounded_task";
-        sub.domain = aida::infra::executor::domain_t::feature_worker;
-        sub.priority = 3;
-        sub.failure_policy = "reject_not_started";
-        sub.shutdown_policy = "drain";
-        sub.body = [promise, start, tag, op, task_ptr]() mutable {
-            bounded_bool_result_t result;
-            result.worker_pid = static_cast<unsigned long>(GetCurrentProcessId());
-            result.worker_tid = static_cast<unsigned long>(GetCurrentThreadId());
+        static test_lab::bounded_runner_t runner(1);
+        const auto worker_result = std::make_shared<bounded_bool_result_t>();
+        const auto result = runner.run(static_cast<std::uint32_t>(timeout_ms), [start, task_ptr, worker_result](test_lab::bounded_run_context_t context) mutable {
+            worker_result->worker_pid = static_cast<unsigned long>(GetCurrentProcessId());
+            worker_result->worker_tid = static_cast<unsigned long>(GetCurrentThreadId());
             SetLastError(ERROR_SUCCESS);
             try {
-                result.value = (*task_ptr)();
+                worker_result->value = (*task_ptr)();
             } catch (const std::exception& ex) {
-                result.threw = true;
-                result.exception = ex.what();
+                worker_result->threw = true;
+                worker_result->exception = ex.what();
             } catch (...) {
-                result.threw = true;
-                result.exception = "unknown_exception";
+                worker_result->threw = true;
+                worker_result->exception = "unknown_exception";
             }
-            result.win32_error = GetLastError();
-            result.completed = true;
+            worker_result->win32_error = GetLastError();
+            worker_result->completed = true;
             const ULONGLONG now = GetTickCount64();
-            result.elapsed_ms = static_cast<unsigned long long>(now >= start ? now - start : 0);
-            try {
-                promise->set_value(std::move(result));
-            } catch (...) {
-            }
-        };
-        const bool started = aida::infra::executor::submit(std::move(sub)).submitted;
-        if (!started) {
-            bounded_bool_result_t result;
-            result.threw = true;
-            result.exception = "taskflow_executor_post_failed";
-            result.win32_error = ERROR_NOT_READY;
-            const ULONGLONG now = GetTickCount64();
-            result.elapsed_ms = static_cast<unsigned long long>(now >= start ? now - start : 0);
+            worker_result->elapsed_ms = static_cast<unsigned long long>(now >= start ? now - start : 0);
+            static_cast<void>(context.cancellation_requested());
+        });
+        bounded_bool_result_t output;
+        if ((result.status == test_lab::bounded_run_status_t::completed ||
+             result.status == test_lab::bounded_run_status_t::exception) && result.worker_exited)
+            output = *worker_result;
+        output.timed_out = result.status == test_lab::bounded_run_status_t::timed_out;
+        output.completed = result.status == test_lab::bounded_run_status_t::completed && result.worker_exited && worker_result->completed;
+        output.threw = result.status == test_lab::bounded_run_status_t::exception ||
+            (result.worker_exited && worker_result->threw);
+        if (result.status == test_lab::bounded_run_status_t::exception && output.exception.empty())
+            output.exception = result.error;
+        if (output.timed_out)
+            output.win32_error = WAIT_TIMEOUT;
+        else if (result.status == test_lab::bounded_run_status_t::exception && output.win32_error == ERROR_SUCCESS)
+            output.win32_error = ERROR_EXCEPTION_IN_SERVICE;
+        output.elapsed_ms = result.elapsed_ms;
+        if (result.status == test_lab::bounded_run_status_t::post_failed ||
+            result.status == test_lab::bounded_run_status_t::saturated) {
+            bounded_bool_result_t post_result;
+            post_result.threw = true;
+            post_result.exception = result.status == test_lab::bounded_run_status_t::saturated
+                ? "bounded_runner_saturated" : (result.error.empty() ? "taskflow_executor_post_failed" : result.error);
+            post_result.win32_error = result.status == test_lab::bounded_run_status_t::saturated
+                ? ERROR_BUSY : ERROR_NOT_READY;
+            post_result.elapsed_ms = result.elapsed_ms;
             log_msg(hf, tag, "BOUNDED-TASKFLOW-EXECUTOR-POST-FAIL -- op=%s gle=%lu elapsed_ms=%llu exception=%s",
-                op, static_cast<unsigned long>(result.win32_error), result.elapsed_ms, result.exception.c_str());
-            return result;
+                op, static_cast<unsigned long>(post_result.win32_error), post_result.elapsed_ms, post_result.exception.c_str());
+            return post_result;
         }
-
-        if (future.wait_for(std::chrono::milliseconds(timeout_ms)) != std::future_status::ready) {
-            bounded_bool_result_t result;
-            result.timed_out = true;
-            result.win32_error = WAIT_TIMEOUT;
-            const ULONGLONG now = GetTickCount64();
-            result.elapsed_ms = static_cast<unsigned long long>(now >= start ? now - start : 0);
-            log_msg(hf, tag, "BOUNDED-TIMEOUT -- op=%s timeout_ms=%lu elapsed_ms=%llu",
-                op, static_cast<unsigned long>(timeout_ms), result.elapsed_ms);
-            return result;
-        }
-        bounded_bool_result_t result = future.get();
-        log_msg(hf, tag, "BOUNDED-END -- op=%s completed=%d value=%d threw=%d gle=%lu worker_pid=%lu worker_tid=%lu elapsed_ms=%llu exception=%s",
+        if (output.timed_out)
+            log_msg(hf, tag, "BOUNDED-TIMEOUT -- op=%s timeout_ms=%lu task_id=%llu cancellation_requested=%d worker_started=%d worker_exited=%d pending=%d elapsed_ms=%llu",
+                op, static_cast<unsigned long>(timeout_ms), static_cast<unsigned long long>(result.task_id),
+                result.cancellation_requested ? 1 : 0, result.worker_started ? 1 : 0,
+                result.worker_exited ? 1 : 0, result.pending ? 1 : 0, output.elapsed_ms);
+        log_msg(hf, tag, "BOUNDED-END -- op=%s completed=%d value=%d threw=%d gle=%lu worker_pid=%lu worker_tid=%lu elapsed_ms=%llu exception_len=%zu",
             op,
-            result.completed ? 1 : 0,
-            result.value ? 1 : 0,
-            result.threw ? 1 : 0,
-            static_cast<unsigned long>(result.win32_error),
-            result.worker_pid,
-            result.worker_tid,
-            result.elapsed_ms,
-            result.exception.c_str());
-        return result;
+            output.completed ? 1 : 0, output.value ? 1 : 0, output.threw ? 1 : 0,
+            static_cast<unsigned long>(output.win32_error), output.worker_pid, output.worker_tid,
+            output.elapsed_ms, output.exception.size());
+        return output;
     }
 
     struct winsock_scope_t {
@@ -2142,10 +2134,16 @@ namespace {
                 static_cast<unsigned long>(install_result.win32_error),
                 install_result.elapsed_ms,
                 install_result.exception.c_str());
+            if (install_result.timed_out || install_result.threw || !install_result.completed) {
+                failed.fetch_add(1);
+                return;
+            }
         } else if (trust_result.timed_out || trust_result.threw) {
             log_msg(hf, tag, "PHASE -- current-user CA install skipped because trust check did not complete timeout=%d threw=%d",
                 trust_result.timed_out ? 1 : 0,
                 trust_result.threw ? 1 : 0);
+            failed.fetch_add(1);
+            return;
         }
         log_msg(hf, tag, "PHASE -- export_public_ca_files begin");
         auto exported = cert_intercept::profiles::export_public_ca_files(ca);

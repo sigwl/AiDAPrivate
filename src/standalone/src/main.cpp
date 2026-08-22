@@ -495,6 +495,7 @@ static std::atomic<UINT>        g_AppliedFontDpi{0};
 static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
 static ID3D11BlendState* blend_state = nullptr;
 static HICON g_aidaWindowIcon = nullptr;
+static bool g_imgui_win32_initialized = false;
 
 helpers helper;
 HWND g_hwnd = nullptr;
@@ -503,7 +504,7 @@ wchar_t g_aidaClassName[128] = L"AiDA";
 static constexpr const wchar_t* kAidaWindowTitle = g_aidaWindowTitle;
 static constexpr int kAidaFullTestHotkeyId = 0xA1DA;
 static constexpr UINT kAidaUiDispatcherWakeMessage = WM_APP + 0x1DB;
-static constexpr UINT kAidaQueuedPeekFlags = PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT | PM_QS_SENDMESSAGE;
+static constexpr UINT kAidaQueuedPeekFlags = PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT | PM_QS_TIMER | PM_QS_SENDMESSAGE;
 static constexpr UINT kAidaSendOnlyPeekFlags = PM_REMOVE | PM_QS_SENDMESSAGE;
 static constexpr DWORD kAidaNonSendQueueBits = QS_INPUT | QS_POSTMESSAGE | QS_TIMER | QS_PAINT | QS_HOTKEY | QS_ALLPOSTMESSAGE;
 static constexpr DWORD kAidaPumpQueueBits = kAidaNonSendQueueBits | QS_SENDMESSAGE;
@@ -2339,12 +2340,13 @@ static const char* startup_bg_phase_label(int step)
     switch (step)
     {
     case 0: return "Bootstrapping";
-    case 1: return "Initializing AiDA runtime core";
-    case 2: return "Probing network surface";
-    case 3: return "Arming memory scanner";
-    case 4: return "Spinning up MITM proxy";
-    case 5: return "Loading script engine";
-    case 6: return "Ready";
+    case 1: return "Connecting kernel driver";
+    case 2: return "Initializing AiDA runtime core";
+    case 3: return "Probing network surface";
+    case 4: return "Arming memory scanner";
+    case 5: return "Spinning up MITM proxy";
+    case 6: return "Loading script engine";
+    case 7: return "Ready";
     default: return "<out_of_range>";
     }
 }
@@ -5423,6 +5425,7 @@ struct draw_data_metrics_t {
 
 static draw_data_metrics_t collect_draw_data_metrics(ImDrawData* draw_data, bool full_walk)
 {
+    static draw_data_metrics_t sampled_metrics{};
     draw_data_metrics_t out{};
     if (!draw_data)
         return out;
@@ -5434,11 +5437,9 @@ static draw_data_metrics_t collect_draw_data_metrics(ImDrawData* draw_data, bool
         return out;
     const int list_count = draw_data->CmdListsCount > 0 ? draw_data->CmdListsCount : 0;
     if (!full_walk) {
-        for (int list_index = 0; list_index < list_count; ++list_index) {
-            const ImDrawList* list = draw_data->CmdLists[list_index];
-            if (list)
-                out.draw_cmds += list->CmdBuffer.Size;
-        }
+        out.draw_cmds = sampled_metrics.draw_cmds;
+        out.callbacks = sampled_metrics.callbacks;
+        out.reset_callbacks = sampled_metrics.reset_callbacks;
         return out;
     }
     for (int list_index = 0; list_index < list_count; ++list_index) {
@@ -5458,6 +5459,7 @@ static draw_data_metrics_t collect_draw_data_metrics(ImDrawData* draw_data, bool
             }
         }
     }
+    sampled_metrics = out;
     return out;
 }
 
@@ -6518,6 +6520,14 @@ int main(int, char**)
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
     ATOM class_atom = ::RegisterClassExW(&wc);
+    const bool class_registered = class_atom != 0;
+    if (!class_registered) {
+        startup_log_critical_fmt("register_class_failed last_err=%lu", static_cast<unsigned long>(GetLastError()));
+        const bool executor_stopped = aida::infra::executor::shutdown(INFINITE);
+        diag::log_tagged_critical_fmt("main", "partial_startup_executor_shutdown complete=%d", executor_stopped ? 1 : 0);
+        release_single_instance_gate();
+        return 1;
+    }
     aida_early_startup::mark("post_gate_register_class_done");
     startup_log_critical_fmt("register_class_post atom=%u last_err=%lu",
         static_cast<unsigned>(class_atom),
@@ -6545,18 +6555,66 @@ int main(int, char**)
                                   250,
                                   nullptr,
                                   nullptr,
-                                  wc.hInstance,
+                                   wc.hInstance,
                                    nullptr);
     aida_early_startup::mark("post_gate_create_window_done");
     g_hwnd = hwnd;
+    if (!hwnd) {
+        startup_log_critical_fmt("create_window_failed last_err=%lu", static_cast<unsigned long>(GetLastError()));
+        if (class_registered)
+            ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        const bool executor_stopped = aida::infra::executor::shutdown(INFINITE);
+        diag::log_tagged_critical_fmt("main", "partial_startup_executor_shutdown complete=%d", executor_stopped ? 1 : 0);
+        release_single_instance_gate();
+        return 1;
+    }
+    bool imgui_context_created = false;
+    bool ide_shell_initialized = false;
+    auto cleanup_partial_startup = [&]() {
+        aida::diagnostics::observer::stop();
+        aida::ui_thread::shutdown();
+        aida_hotkey_monitor::stop();
+        aida_focus_monitor::stop();
+        if (ide_shell_initialized) {
+            aida::ui::ide_shell::shutdown();
+            ide_shell_initialized = false;
+        }
+        const bool executor_stopped = aida::infra::executor::shutdown(INFINITE);
+        diag::log_tagged_critical_fmt("main", "partial_startup_executor_shutdown complete=%d", executor_stopped ? 1 : 0);
+        if (hwnd && IsWindow(hwnd))
+            ::DestroyWindow(hwnd);
+        if (g_imgui_dx11_initialized) {
+            ImGui_ImplDX11_Shutdown();
+            g_imgui_dx11_initialized = false;
+        }
+        if (g_imgui_win32_initialized) {
+            ImGui_ImplWin32_Shutdown();
+            g_imgui_win32_initialized = false;
+        }
+        if (imgui_context_created)
+            ImGui::DestroyContext();
+        if (blend_state) {
+            blend_state->Release();
+            blend_state = nullptr;
+        }
+        CleanupDeviceD3D();
+        if (g_aidaWindowIcon) {
+            DestroyIcon(g_aidaWindowIcon);
+            g_aidaWindowIcon = nullptr;
+        }
+        if (class_registered)
+            ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        release_single_instance_gate();
+    };
     {
         aida::diagnostics::observer::observer_config_t obs_cfg;
         obs_cfg.enabled = true;
         obs_cfg.poll_interval_ms = 5000;
         obs_cfg.hung_threshold_ms = 5000;
-        obs_cfg.max_lifetime_ms = 600000;
+        obs_cfg.max_lifetime_ms = 0;
         obs_cfg.wm_null_timeout_ms = 200;
-        aida::diagnostics::observer::start(GetCurrentProcessId(), hwnd, obs_cfg);
+        if (!aida::diagnostics::observer::start(GetCurrentProcessId(), hwnd, obs_cfg))
+            diag::log_tagged_critical("main", "observer_start_failed");
     }
     DWORD hwnd_owner_tid = hwnd ? ::GetWindowThreadProcessId(hwnd, nullptr) : 0;
     if (hwnd_owner_tid != 0)
@@ -6613,8 +6671,7 @@ int main(int, char**)
             static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
             static_cast<unsigned long>(GetLastError()));
         crash_log_write("d3d_creation_FAILED");
-        CleanupDeviceD3D();
-        ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        cleanup_partial_startup();
         return 1;
     }
     startup_log_critical_fmt("create_d3d_post device=0x%llX ctx=0x%llX swapchain=0x%llX last_err=%lu",
@@ -6663,9 +6720,12 @@ int main(int, char**)
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
-    if (!aida::ui_thread::require_owner("imgui", "create_context", "startup"))
+    if (!aida::ui_thread::require_owner("imgui", "create_context", "startup")) {
+        cleanup_partial_startup();
         return 1;
+    }
     ImGui::CreateContext();
+    imgui_context_created = true;
     aida_early_startup::mark("post_gate_imgui_context_create_done");
     startup_log_critical_fmt("imgui_context_create_post ctx=0x%llX",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(ImGui::GetCurrentContext())));
@@ -6675,8 +6735,10 @@ int main(int, char**)
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
-    if (!aida::ui_thread::require_owner("imgui", "get_io", "startup"))
+    if (!aida::ui_thread::require_owner("imgui", "get_io", "startup")) {
+        cleanup_partial_startup();
         return 1;
+    }
     ImGuiIO& io = ImGui::GetIO();
     startup_log_critical_fmt("imgui_getio_post io=0x%llX fonts=0x%llX config=0x%08X",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(&io)),
@@ -6733,24 +6795,37 @@ int main(int, char**)
     crash_log_write("fonts_built");
     startup_log_critical_fmt("imgui_backend_win32_pre hwnd=0x%llX",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)));
-    if (!aida::ui_thread::require_owner("imgui_win32", "backend_init", "startup"))
+    if (!aida::ui_thread::require_owner("imgui_win32", "backend_init", "startup")) {
+        cleanup_partial_startup();
         return 1;
-    ImGui_ImplWin32_Init(hwnd);
-    startup_log_critical_fmt("imgui_backend_win32_post last_err=%lu",
+    }
+    g_imgui_win32_initialized = ImGui_ImplWin32_Init(hwnd);
+    startup_log_critical_fmt("imgui_backend_win32_post initialized=%d last_err=%lu",
+        g_imgui_win32_initialized ? 1 : 0,
         static_cast<unsigned long>(GetLastError()));
+    if (!g_imgui_win32_initialized) {
+        cleanup_partial_startup();
+        return 1;
+    }
     crash_log_write("imgui_win32_init_ok");
     startup_log_critical_fmt("imgui_backend_dx11_pre device=0x%llX ctx=0x%llX",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_pd3dDevice)),
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_pd3dDeviceContext)));
-    if (!aida::ui_thread::require_owner("dx11", "imgui_backend_init", "startup"))
+    if (!aida::ui_thread::require_owner("dx11", "imgui_backend_init", "startup")) {
+        cleanup_partial_startup();
         return 1;
-    ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
-    g_imgui_dx11_initialized = true;
+    }
+    g_imgui_dx11_initialized = ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
     startup_log_critical_fmt("imgui_backend_dx11_post initialized=%d last_err=%lu",
         g_imgui_dx11_initialized ? 1 : 0,
         static_cast<unsigned long>(GetLastError()));
+    if (!g_imgui_dx11_initialized) {
+        cleanup_partial_startup();
+        return 1;
+    }
     crash_log_write("imgui_dx11_init_ok");
     aida::ui::ide_shell::initialize();
+    ide_shell_initialized = true;
     D3D11_BLEND_DESC blend_desc = {};
     blend_desc.RenderTarget[0].BlendEnable = TRUE;
     blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
@@ -6762,9 +6837,19 @@ int main(int, char**)
     blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     startup_log_critical_fmt("blend_state_create_pre device=0x%llX",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_pd3dDevice)));
-    g_pd3dDevice->CreateBlendState(&blend_desc, &blend_state);
-    if (!aida::ui_thread::require_owner("dx11", "blend_state", "startup"))
+    const HRESULT blend_hr = g_pd3dDevice->CreateBlendState(&blend_desc, &blend_state);
+    if (FAILED(blend_hr) || !blend_state) {
+        startup_log_critical_fmt("blend_state_create_failed hr=0x%08X state=0x%llX last_err=%lu",
+            static_cast<unsigned>(blend_hr),
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(blend_state)),
+            static_cast<unsigned long>(GetLastError()));
+        cleanup_partial_startup();
         return 1;
+    }
+    if (!aida::ui_thread::require_owner("dx11", "blend_state", "startup")) {
+        cleanup_partial_startup();
+        return 1;
+    }
     g_pd3dDeviceContext->OMSetBlendState(blend_state, nullptr, 0xffffffff);
     startup_log_critical_fmt("blend_state_create_post blend=0x%llX last_err=%lu",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(blend_state)),
@@ -6774,12 +6859,19 @@ int main(int, char**)
 
     static std::atomic<bool> bg_init_done{false};
     globals::ui::bg_init_done = &bg_init_done;
-    globals::ui::bg_init_total.store(6, std::memory_order_release);
+    globals::ui::bg_init_total.store(7, std::memory_order_release);
     globals::ui::bg_init_step.store(0, std::memory_order_release);
     startup_log_critical_fmt("bg_init_config total=%d initial_step=%d label=%s pid=%lu tid=%lu tick=%llu",
         globals::ui::bg_init_total.load(std::memory_order_acquire),
         globals::ui::bg_init_step.load(std::memory_order_acquire),
         startup_bg_phase_label(globals::ui::bg_init_step.load(std::memory_order_acquire)),
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(GetTickCount64()));
+    driver_bridge::set_log_callback([](const std::string& msg) {
+        crash_log_write(msg.c_str());
+    });
+    startup_log_critical_fmt("driver_bridge_log_callback_set pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
@@ -6850,36 +6942,49 @@ int main(int, char**)
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
                 static_cast<unsigned long>(GetLastError()));
             startup_store_bg_step(step, "bg_init_worker", phase);
+            return cpp_ok && seh_code == 0;
         };
 
-        run_step("init_standalone_chat_start", "init_standalone_chat", "standalone_chat_init_ok", 1,
-            []() { return seh_init_standalone_chat(); });
+        const bool driver_ready = run_step("driver_bridge_init_start", "driver_bridge_init", "driver_bridge_init_ok", 1,
+            []() {
+                const DWORD seh = seh_driver_bridge_initialize();
+                if (seh != 0)
+                    return seh;
+                return driver_bridge::is_loaded() ? static_cast<DWORD>(ERROR_SUCCESS) : static_cast<DWORD>(ERROR_DEVICE_NOT_AVAILABLE);
+            });
 
-        run_step("network_view_init_start", "network_view_init", "network_view_init_ok", 2,
-            []() { return seh_network_view_initialize(); });
+        bool startup_steps_ok = true;
+        startup_steps_ok = run_step("init_standalone_chat_start", "init_standalone_chat", "standalone_chat_init_ok", 2,
+            []() { return seh_init_standalone_chat(); }) && startup_steps_ok;
 
-        run_step("memory_scanner_init_start", "memory_scanner_init", "memory_scanner_init_ok", 3,
-            []() { return seh_memory_scanner_initialize(); });
+        startup_steps_ok = run_step("network_view_init_start", "network_view_init", "network_view_init_ok", 3,
+            []() { return seh_network_view_initialize(); }) && startup_steps_ok;
 
-        run_step("mitm_proxy_pre_init_start", "mitm_proxy_pre_init", "mitm_proxy_pre_init_ok", 4,
-            []() { return seh_mitm_proxy_pre_initialize(); });
+        startup_steps_ok = run_step("memory_scanner_init_start", "memory_scanner_init", "memory_scanner_init_ok", 4,
+            []() { return seh_memory_scanner_initialize(); }) && startup_steps_ok;
 
-        startup_log_critical_fmt("bg_init_script_engine_async_pre phase=script_engine_init target_step=5 target_label=%s pid=%lu tid=%lu tick=%llu",
-            startup_bg_phase_label(5),
+        startup_steps_ok = run_step("mitm_proxy_pre_init_start", "mitm_proxy_pre_init", "mitm_proxy_pre_init_ok", 5,
+            []() { return seh_mitm_proxy_pre_initialize(); }) && startup_steps_ok;
+
+        startup_log_critical_fmt("bg_init_script_engine_async_pre phase=script_engine_init target_step=6 target_label=%s pid=%lu tid=%lu tick=%llu",
+            startup_bg_phase_label(6),
             GetCurrentProcessId(),
             GetCurrentThreadId(),
             static_cast<unsigned long long>(GetTickCount64()));
         diag::log_tagged("bg_init", "script_engine_init_async_start");
         post_script_engine_startup_initialize();
-        startup_store_bg_step(5, "bg_init_worker", "script_engine_init_async_posted");
+        startup_store_bg_step(6, "bg_init_worker", "script_engine_init_async_posted");
         diag::log_tagged("bg_init", "script_engine_init_async_posted");
-        g_authorized_features_initialized.store(true, std::memory_order_release);
-        g_authorized_features_posted.store(true, std::memory_order_release);
+        g_authorized_features_initialized.store(startup_steps_ok, std::memory_order_release);
+        g_authorized_features_posted.store(startup_steps_ok, std::memory_order_release);
 
-        startup_store_bg_step(6, "bg_init_worker", "bg_init_all_steps_done");
+        startup_store_bg_step(7, "bg_init_worker", "bg_init_all_steps_done");
 
         bg_init_done.store(true, std::memory_order_release);
-        startup_log_critical_fmt("bg_init_thread_exit elapsed_ms=%llu final_step=%d pid=%lu tid=%lu tick=%llu",
+        startup_log_critical_fmt("bg_init_thread_exit ok=%d driver_ready=%d driver_status=%.160s elapsed_ms=%llu final_step=%d pid=%lu tid=%lu tick=%llu",
+            startup_steps_ok ? 1 : 0,
+            driver_ready ? 1 : 0,
+            driver_bridge::status().c_str(),
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - thread_tick),
             globals::ui::bg_init_step.load(std::memory_order_acquire),
             GetCurrentProcessId(),
@@ -6888,64 +6993,22 @@ int main(int, char**)
         diag::log_tagged("bg_init", "thread_exit");
     });
     bool bg_posted = bg_submit_result.submitted;
-    startup_log_critical_fmt("bg_init_critical_post_post posted=%d pid=%lu tid=%lu tick=%llu",
+    startup_log_critical_fmt("bg_init_critical_post_post posted=%d reject_reason=%.160s pid=%lu tid=%lu tick=%llu",
         bg_posted ? 1 : 0,
+        bg_submit_result.reject_reason.empty() ? "<none>" : bg_submit_result.reject_reason.c_str(),
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
-
-
-    driver_bridge::set_log_callback([](const std::string& msg) {
-        crash_log_write(msg.c_str());
-    });
-    startup_log_critical_fmt("driver_bridge_log_callback_set pid=%lu tid=%lu tick=%llu",
-        GetCurrentProcessId(),
-        GetCurrentThreadId(),
-        static_cast<unsigned long long>(GetTickCount64()));
-
-
-    startup_log_critical_fmt("driver_bridge_init_critical_post_pre pid=%lu tid=%lu tick=%llu",
-        GetCurrentProcessId(),
-        GetCurrentThreadId(),
-        static_cast<unsigned long long>(GetTickCount64()));
-    startup_log_critical_fmt("driver_bridge_launch_context before_post loaded=%d kernel=%d",
-        driver_bridge::is_loaded() ? 1 : 0,
-        driver_bridge::using_kernel_driver() ? 1 : 0);
-    const auto driver_submit_result = submit_main_executor_task(
-        "startup",
-        "startup.driver_bridge_init",
-        aida::infra::executor::domain_t::security_liveness,
-        "driver",
-        [] {
-        const uint64_t driver_tick = static_cast<uint64_t>(GetTickCount64());
-        startup_log_critical_fmt("driver_bridge_init_thread_entry pid=%lu tid=%lu tick=%llu",
-            GetCurrentProcessId(),
-            GetCurrentThreadId(),
-            static_cast<unsigned long long>(driver_tick));
-        diag::log_tagged("drv_init", "thread_entry");
-        DWORD seh_dbi = seh_driver_bridge_initialize();
-        if (seh_dbi != 0)
-            diag::log_tagged_fmt("drv_init", "driver_bridge_initialize_seh code=0x%08X last_err=%lu", seh_dbi, GetLastError());
-        startup_log_critical_fmt("driver_bridge_launch_context after_initialize seh=0x%08X loaded=%d kernel=%d",
-            seh_dbi,
-            driver_bridge::is_loaded() ? 1 : 0,
-            driver_bridge::using_kernel_driver() ? 1 : 0);
-        startup_log_critical_fmt("driver_bridge_init_thread_exit seh=0x%08X loaded=%d kernel=%d status=%.160s elapsed_ms=%llu last_err=%lu",
-            seh_dbi,
-            driver_bridge::is_loaded() ? 1 : 0,
-            driver_bridge::using_kernel_driver() ? 1 : 0,
-            driver_bridge::status().c_str(),
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - driver_tick),
-            static_cast<unsigned long>(GetLastError()));
-        diag::log_tagged("drv_init", "thread_exit");
-    });
-    bool driver_posted = driver_submit_result.submitted;
-    startup_log_critical_fmt("driver_bridge_init_critical_post_post posted=%d pid=%lu tid=%lu tick=%llu",
-        driver_posted ? 1 : 0,
-        GetCurrentProcessId(),
-        GetCurrentThreadId(),
-        static_cast<unsigned long long>(GetTickCount64()));
-    crash_log_write("driver_bridge_thread_launched");
+    if (!bg_posted) {
+        startup_store_bg_step(7, "bg_init_submit_rejected", "bg_init_not_started");
+        bg_init_done.store(true, std::memory_order_release);
+        g_authorized_features_initialized.store(false, std::memory_order_release);
+        g_authorized_features_posted.store(false, std::memory_order_release);
+        diag::log_tagged_critical_fmt("bg_init",
+            "submission_rejected reason=%.160s loading_released=1 final_step=%d",
+            bg_submit_result.reject_reason.empty() ? "<none>" : bg_submit_result.reject_reason.c_str(),
+            globals::ui::bg_init_step.load(std::memory_order_acquire));
+    }
 
 
     ImVec4 clear_color = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -8389,7 +8452,10 @@ int main(int, char**)
         aida::diagnostics::metadata_ring::breadcrumb_category_t::startup_shutdown,
         "standalone_shutdown_begin", "cleanup_starting", true);
     aida::diagnostics::metadata_ring::request_shutdown();
-    aida::diagnostics::observer::stop();
+    const bool shutdown_admitted = claim_chrome_shutdown_admission("main.shutdown_sequence");
+    diag::log_tagged_critical_fmt("main", "shutdown_admission_done admitted=%d", shutdown_admitted ? 1 : 0);
+    const bool observer_stopped = aida::diagnostics::observer::stop();
+    diag::log_tagged_critical_fmt("main", "shutdown_observer_done joined=%d", observer_stopped ? 1 : 0);
     diag::log_tagged_critical_fmt("main",
         "shutdown_sequence_begin frame=%llu done=%d hwnd=0x%llX tid=%lu",
         (unsigned long long)frame_number,
@@ -8404,12 +8470,30 @@ int main(int, char**)
         diag::log_tagged_critical_fmt("main", "shutdown_queue_snapshot_pre %s", queue_snapshot);
     }
     aida_shutdown_diag::mark("shutdown_testlab_cancel");
-    test_all_features::cancel_tests();
+    test_all_features::cancel_tests_for_shutdown();
     diag::log_tagged_critical("main", "shutdown_testlab_cancel_done");
     aida_shutdown_diag::mark("shutdown_camoufox_force_cleanup");
     try {
-        aida::burp::camoufox::force_cleanup("main.shutdown_sequence");
-        diag::log_tagged_critical("main", "shutdown_camoufox_force_cleanup_done");
+        const auto cleanup_before = aida::burp::camoufox::get_status();
+        const std::uint64_t cleanup_generation_before = cleanup_before.cleanup_generation;
+        const bool cleanup_requested = aida::burp::camoufox::force_cleanup("main.shutdown_sequence");
+        const auto cleanup_request = aida::burp::camoufox::get_status();
+        const std::uint64_t cleanup_generation = cleanup_request.cleanup_generation;
+        const bool cleanup_receipt = aida::burp::camoufox::wait_until_idle(20000, "main.shutdown_sequence.receipt");
+        const auto cleanup_after = aida::burp::camoufox::get_status();
+        const bool generation_drained = !cleanup_after.cleanup_pending &&
+            (cleanup_generation == 0 || cleanup_after.cleanup_generation == cleanup_generation) &&
+            !cleanup_after.child_alive && cleanup_after.child_process_count == 0;
+        const bool cleanup_complete = cleanup_requested && cleanup_receipt && generation_drained;
+        diag::log_tagged_critical_fmt("main", "shutdown_camoufox_force_cleanup_done complete=%d request=%d receipt=%d generation_before=%llu generation_after=%llu cleanup_pending=%d child_pid=%u child_alive=%d",
+            cleanup_complete ? 1 : 0,
+            cleanup_requested ? 1 : 0,
+            cleanup_receipt ? 1 : 0,
+            static_cast<unsigned long long>(cleanup_generation_before),
+            static_cast<unsigned long long>(cleanup_generation),
+            cleanup_after.cleanup_pending ? 1 : 0,
+            static_cast<unsigned>(cleanup_after.child_pid),
+            cleanup_after.child_alive ? 1 : 0);
     } catch (...) {
         aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "shutdown_camoufox_force_cleanup");
         diag::log_tagged_critical("main", "shutdown_camoufox_force_cleanup_exception");
@@ -8429,6 +8513,12 @@ int main(int, char**)
     aida_shutdown_diag::mark("shutdown_terminal");
     globals::terminal_mgr.shutdown();
     diag::log_tagged_critical("main", "shutdown_terminal_done");
+
+    aida_shutdown_diag::mark("shutdown_memory_scanner");
+    const uint64_t shutdown_scanner_start_ms = static_cast<uint64_t>(GetTickCount64());
+    memory_scanner::shutdown();
+    diag::log_tagged_critical_fmt("main", "shutdown_memory_scanner_done elapsed_ms=%llu",
+        static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - shutdown_scanner_start_ms));
 
     aida_shutdown_diag::mark("shutdown_network");
     {
@@ -8463,8 +8553,16 @@ int main(int, char**)
         aida::ui::ide_shell::shutdown();
     diag::log_tagged_critical("main", "shutdown_ide_shell_done");
     aida_shutdown_diag::mark("shutdown_executor");
-    aida::infra::executor::shutdown();
-    diag::log_tagged_critical("main", "shutdown_executor_done");
+    bool executor_stopped = aida::infra::executor::shutdown();
+    if (!executor_stopped) {
+        diag::log_tagged_critical("main", "shutdown_executor_incomplete_waiting_for_full_drain");
+        executor_stopped = aida::infra::executor::shutdown(INFINITE);
+    }
+    diag::log_tagged_critical_fmt("main", "shutdown_executor_done complete=%d", executor_stopped ? 1 : 0);
+    aida_shutdown_diag::mark("shutdown_destroy_window");
+    if (hwnd && IsWindow(hwnd))
+        ::DestroyWindow(hwnd);
+    diag::log_tagged_critical("main", "shutdown_destroy_window_done");
     aida_shutdown_diag::mark("shutdown_imgui_dx11");
     if (aida::ui_thread::require_owner("dx11", "imgui_dx11_shutdown", "shutdown"))
         ImGui_ImplDX11_Shutdown();
@@ -8477,14 +8575,21 @@ int main(int, char**)
     aida_shutdown_diag::mark("shutdown_imgui_context");
     if (aida::ui_thread::require_owner("imgui", "destroy_context", "shutdown"))
         ImGui::DestroyContext();
+    g_imgui_dx11_initialized = false;
+    g_imgui_win32_initialized = false;
     diag::log_tagged_critical("main", "shutdown_imgui_context_done");
 
     aida_shutdown_diag::mark("shutdown_d3d");
+    if (blend_state) {
+        blend_state->Release();
+        blend_state = nullptr;
+    }
     CleanupDeviceD3D();
     diag::log_tagged_critical("main", "shutdown_d3d_done");
-    aida_shutdown_diag::mark("shutdown_destroy_window");
-    ::DestroyWindow(hwnd);
-    diag::log_tagged_critical("main", "shutdown_destroy_window_done");
+    if (g_aidaWindowIcon) {
+        DestroyIcon(g_aidaWindowIcon);
+        g_aidaWindowIcon = nullptr;
+    }
     aida_shutdown_diag::mark("shutdown_unregister_class");
     ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
     diag::log_tagged_critical("main", "shutdown_unregister_done");
@@ -8532,6 +8637,10 @@ bool CreateDeviceD3D(HWND hWnd)
         return false;
 
     CreateRenderTarget();
+    if (!g_mainRenderTargetView) {
+        CleanupDeviceD3D();
+        return false;
+    }
     initialize_gpu_frame_queries();
     return true;
 }
@@ -8821,6 +8930,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     if (msg == WM_NCDESTROY) {
         aida::ui_thread::mark_window_destroying(hWnd, "wndproc", "wm_ncdestroy", "enter");
+        return finish("ncdestroy", ::DefWindowProcW(hWnd, msg, wParam, lParam));
     }
 
     if (trace_input_msg) {

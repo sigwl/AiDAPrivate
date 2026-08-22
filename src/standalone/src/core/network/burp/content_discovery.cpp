@@ -398,14 +398,40 @@ void publish_exchange(const std::string& url, int status, const std::string& bod
     sitemap::ingest_exchange(ev);
 }
 
-void run_disc(std::shared_ptr<disc_t> ctx);
+using admission_ptr_t = std::shared_ptr<mcp_standalone::downstream::scoped_admission_t>;
 
-void worker_one(std::shared_ptr<disc_t> ctx, candidate_t cand)
+bool run_disc(std::shared_ptr<disc_t> ctx, admission_ptr_t admission);
+
+bool terminalize(const std::shared_ptr<disc_t>& ctx, disc_phase_t phase,
+                 const std::string& reason, bool cancelled)
+{
+    if (!ctx) return false;
+    const uint64_t finished_ms = now_ms();
+    {
+        std::lock_guard<std::timed_mutex> lk(ctx->mtx);
+        if (ctx->finished.load(std::memory_order_acquire)) return false;
+        ctx->stop_flag.store(cancelled || phase == disc_phase_t::error, std::memory_order_release);
+        ctx->queue.clear();
+        ctx->phase.store(phase, std::memory_order_release);
+        if (!reason.empty()) ctx->last_error = reason;
+        ctx->finished_unix_ms.store(finished_ms, std::memory_order_release);
+        ctx->finished.store(true, std::memory_order_release);
+    }
+    aida::events::publish(kJobStateChangedEvent, job_state_changed_t{
+        "content_discovery", ctx->id,
+        phase == disc_phase_t::error ? "error" : "complete",
+        reason, finished_ms, cancelled, true});
+    diag::log_tagged_fmt("burp.content_discovery", "disc_terminalized id=%llu phase=%d cancelled=%d reason=%s queued=0 in_flight=%d",
+        static_cast<unsigned long long>(ctx->id), static_cast<int>(phase), cancelled ? 1 : 0,
+        reason.empty() ? "<none>" : reason.c_str(), ctx->in_flight.load(std::memory_order_acquire));
+    return true;
+}
+
+bool worker_one(std::shared_ptr<disc_t> ctx, candidate_t cand, admission_ptr_t admission)
 {
     diag::log_tagged_fmt("content_discovery", "worker_one id=%llu url=%s depth=%d",
         static_cast<unsigned long long>(ctx->id), cand.url.c_str(), cand.depth);
     auto& d = *ctx;
-    d.in_flight.fetch_add(1);
 
     int status = 0;
     size_t body_bytes = 0;
@@ -416,6 +442,10 @@ void worker_one(std::shared_ptr<disc_t> ctx, candidate_t cand)
     diag::log_tagged_fmt("content_discovery", "worker_one result id=%llu url=%s ok=%d status=%d body=%zu lat=%llu err=%s",
         static_cast<unsigned long long>(ctx->id), cand.url.c_str(), ok ? 1 : 0,
         status, body_bytes, static_cast<unsigned long long>(lat), err.c_str());
+    if (d.finished.load(std::memory_order_acquire)) {
+        d.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+        return false;
+    }
 
     d.attempts.fetch_add(1);
     if (!ok) {
@@ -482,7 +512,7 @@ void worker_one(std::shared_ptr<disc_t> ctx, candidate_t cand)
                 if (!entries.empty())
                 {
                     std::lock_guard<std::timed_mutex> lk(d.mtx);
-                    for (auto& e : entries)
+                    if (!d.finished.load(std::memory_order_acquire)) for (auto& e : entries)
                     {
                         if (d.config.extensions.empty())
                         {
@@ -519,25 +549,12 @@ void worker_one(std::shared_ptr<disc_t> ctx, candidate_t cand)
         std::this_thread::sleep_for(std::chrono::milliseconds(d.config.delay_ms));
 
     d.in_flight.fetch_sub(1);
+    if (d.finished.load(std::memory_order_acquire)) return false;
     {
-        mcp_standalone::downstream::producer_identity_t cont_id;
-        cont_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
-        cont_id.tool_name = "content_discovery.run_disc";
-        cont_id.domain = d.config.target_url;
-        auto cont_admission = mcp_standalone::downstream::scoped_admission_t::acquire(cont_id);
-        if (!cont_admission.active()) {
-            diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-REJECT id=%llu reason=%s quota=%s observed=%zu limit=%zu",
-                static_cast<unsigned long long>(d.id),
-                cont_admission.result().reason.c_str(),
-                cont_admission.result().quota_name.c_str(),
-                cont_admission.result().observed, cont_admission.result().limit);
-            return;
-        }
-        const uint64_t cont_token = cont_admission.token();
-        diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-ADMIT id=%llu token=%llu phase=continuation",
+        const uint64_t cont_token = admission->token();
+        diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-TRANSFER id=%llu token=%llu phase=continuation",
             static_cast<unsigned long long>(d.id),
             static_cast<unsigned long long>(cont_token));
-        auto cont_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(cont_admission));
         if (![&]() {
             ::aida::infra::executor::submission_t sub;
             sub.owner_subsystem = "burp.content_discovery";
@@ -545,26 +562,33 @@ void worker_one(std::shared_ptr<disc_t> ctx, candidate_t cand)
             sub.thread_class = "bounded_task";
             sub.domain = aida::infra::executor::domain_t::feature_worker;
             sub.priority = 3;
-            sub.body = [ctx, cont_admission_ptr, cont_token]() {
-            run_disc(ctx);
-            diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed",
-                static_cast<unsigned long long>(ctx->id),
-                static_cast<unsigned long long>(cont_token));
-            cont_admission_ptr->release("completed");
+            sub.body = [ctx, admission, cont_token]() {
+            const bool transferred = run_disc(ctx, admission);
+            if (!transferred) {
+                diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed",
+                    static_cast<unsigned long long>(ctx->id),
+                    static_cast<unsigned long long>(cont_token));
+                admission->release("completed");
+            }
         };
             return ::aida::infra::executor::submit(std::move(sub)).submitted;
         }()) {
             diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=executor_unavailable",
                 static_cast<unsigned long long>(d.id),
                 static_cast<unsigned long long>(cont_token));
+            const bool cancelled = ctx->stop_flag.load(std::memory_order_acquire);
+            terminalize(ctx, cancelled ? disc_phase_t::complete : disc_phase_t::error,
+                "continuation executor submission rejected", cancelled);
+            return false;
         }
+        return true;
     }
 }
 
-void run_disc(std::shared_ptr<disc_t> ctx)
+bool run_disc(std::shared_ptr<disc_t> ctx, admission_ptr_t admission)
 {
     auto& d = *ctx;
-    if (d.finished.load()) return;
+    if (d.finished.load()) return false;
     if (d.stop_flag.load())
     {
         std::lock_guard<std::timed_mutex> lk(d.mtx);
@@ -578,43 +602,28 @@ void run_disc(std::shared_ptr<disc_t> ctx)
         {
             next = std::move(d.queue.back());
             d.queue.pop_back();
+            d.in_flight.fetch_add(1, std::memory_order_acq_rel);
             has = true;
         }
     }
     if (has)
     {
-        worker_one(ctx, next);
-        return;
+        return worker_one(ctx, next, std::move(admission));
     }
     if (d.in_flight.load() == 0)
     {
-        if (d.finished.exchange(true)) return;
-        std::lock_guard<std::timed_mutex> lk(d.mtx);
-        d.phase.store(disc_phase_t::complete, std::memory_order_release);
-        d.finished_unix_ms.store(now_ms(), std::memory_order_release);
-        diag::log_tagged_fmt("burp.content_discovery", "disc_finished id=%llu attempts=%d hits=%d errors=%d filtered=%d",
-            static_cast<unsigned long long>(d.id), d.attempts.load(), d.hits_count.load(), d.errors.load(), d.filtered.load());
-        return;
+        const bool cancelled = d.stop_flag.load(std::memory_order_acquire);
+        if (terminalize(ctx, disc_phase_t::complete,
+                cancelled ? "cancelled" : std::string(), cancelled))
+            diag::log_tagged_fmt("burp.content_discovery", "disc_finished id=%llu attempts=%d hits=%d errors=%d filtered=%d",
+                static_cast<unsigned long long>(d.id), d.attempts.load(), d.hits_count.load(), d.errors.load(), d.filtered.load());
+        return false;
     }
     {
-        mcp_standalone::downstream::producer_identity_t wait_id;
-        wait_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
-        wait_id.tool_name = "content_discovery.run_disc_wait";
-        wait_id.domain = d.config.target_url;
-        auto wait_admission = mcp_standalone::downstream::scoped_admission_t::acquire(wait_id);
-        if (!wait_admission.active()) {
-            diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-REJECT id=%llu reason=%s quota=%s observed=%zu limit=%zu phase=wait",
-                static_cast<unsigned long long>(d.id),
-                wait_admission.result().reason.c_str(),
-                wait_admission.result().quota_name.c_str(),
-                wait_admission.result().observed, wait_admission.result().limit);
-            return;
-        }
-        const uint64_t wait_token = wait_admission.token();
-        diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-ADMIT id=%llu token=%llu phase=wait",
+        const uint64_t wait_token = admission->token();
+        diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-TRANSFER id=%llu token=%llu phase=wait",
             static_cast<unsigned long long>(d.id),
             static_cast<unsigned long long>(wait_token));
-        auto wait_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(wait_admission));
         if (![&]() {
             ::aida::infra::executor::submission_t sub;
             sub.owner_subsystem = "burp.content_discovery";
@@ -622,20 +631,27 @@ void run_disc(std::shared_ptr<disc_t> ctx)
             sub.thread_class = "bounded_task";
             sub.domain = aida::infra::executor::domain_t::feature_worker;
             sub.priority = 3;
-            sub.body = [ctx, wait_admission_ptr, wait_token]() {
+            sub.body = [ctx, admission, wait_token]() {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            run_disc(ctx);
-            diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed",
-                static_cast<unsigned long long>(ctx->id),
-                static_cast<unsigned long long>(wait_token));
-            wait_admission_ptr->release("completed");
+            const bool transferred = run_disc(ctx, admission);
+            if (!transferred) {
+                diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed",
+                    static_cast<unsigned long long>(ctx->id),
+                    static_cast<unsigned long long>(wait_token));
+                admission->release("completed");
+            }
         };
             return ::aida::infra::executor::submit(std::move(sub)).submitted;
         }()) {
             diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=executor_unavailable",
                 static_cast<unsigned long long>(d.id),
                 static_cast<unsigned long long>(wait_token));
+            const bool cancelled = ctx->stop_flag.load(std::memory_order_acquire);
+            terminalize(ctx, cancelled ? disc_phase_t::complete : disc_phase_t::error,
+                "wait executor submission rejected", cancelled);
+            return false;
         }
+        return true;
     }
 }
 
@@ -817,15 +833,7 @@ uint64_t start(const config_t& cfg)
             start_admission.result().reason.c_str(),
             start_admission.result().quota_name.c_str(),
             start_admission.result().observed, start_admission.result().limit);
-        {
-            std::unique_lock<std::timed_mutex> lk(ctx->mtx, std::defer_lock);
-            if (lk.try_lock_for(std::chrono::milliseconds(kRunLockTimeoutMs))) {
-                ctx->phase.store(disc_phase_t::error, std::memory_order_release);
-                ctx->last_error = "downstream capacity exhausted";
-                ctx->finished_unix_ms.store(now_ms(), std::memory_order_release);
-            }
-        }
-        ctx->finished.store(true, std::memory_order_release);
+        terminalize(ctx, disc_phase_t::error, "downstream capacity exhausted", false);
         set_err("downstream capacity exhausted");
         std::unique_lock<std::timed_mutex> reg_lk(reg().mtx, std::defer_lock);
         if (reg_lk.try_lock_for(std::chrono::milliseconds(kRegistryLockTimeoutMs)))
@@ -847,6 +855,21 @@ uint64_t start(const config_t& cfg)
         sub.priority = 3;
         sub.body = [ctx, start_admission_ptr, start_token]() {
         if (ctx->config.auto_calibrate) auto_calibrate(*ctx);
+        if (ctx->finished.load(std::memory_order_acquire)) {
+            diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=terminal_during_calibration phase=start_outer",
+                static_cast<unsigned long long>(ctx->id),
+                static_cast<unsigned long long>(start_token));
+            start_admission_ptr->release("terminal_during_calibration");
+            return;
+        }
+        if (ctx->stop_flag.load(std::memory_order_acquire)) {
+            terminalize(ctx, disc_phase_t::complete, "cancelled", true);
+            diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=cancelled_during_calibration phase=start_outer",
+                static_cast<unsigned long long>(ctx->id),
+                static_cast<unsigned long long>(start_token));
+            start_admission_ptr->release("cancelled_during_calibration");
+            return;
+        }
         {
             std::unique_lock<std::timed_mutex> lk(ctx->mtx, std::defer_lock);
             if (lk.try_lock_for(std::chrono::milliseconds(kRunLockTimeoutMs)))
@@ -858,22 +881,31 @@ uint64_t start(const config_t& cfg)
         }
         int kick = std::max(1, std::min(ctx->config.concurrency, 64));
         int posted_kicks = 0;
+        bool start_admission_transferred = false;
         for (int i = 0; i < kick; ++i) {
-            mcp_standalone::downstream::producer_identity_t kick_id;
-            kick_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
-            kick_id.tool_name = "content_discovery.run_disc_kick";
-            kick_id.domain = ctx->config.target_url;
-            auto kick_admission = mcp_standalone::downstream::scoped_admission_t::acquire(kick_id);
-            if (!kick_admission.active()) {
-                diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-REJECT id=%llu reason=%s quota=%s observed=%zu limit=%zu phase=kick",
+            admission_ptr_t kick_admission_ptr;
+            if (!start_admission_transferred) {
+                kick_admission_ptr = start_admission_ptr;
+                diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-TRANSFER id=%llu token=%llu phase=start_to_kick",
                     static_cast<unsigned long long>(ctx->id),
-                    kick_admission.result().reason.c_str(),
-                    kick_admission.result().quota_name.c_str(),
-                    kick_admission.result().observed, kick_admission.result().limit);
-                continue;
+                    static_cast<unsigned long long>(start_token));
+            } else {
+                mcp_standalone::downstream::producer_identity_t kick_id;
+                kick_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
+                kick_id.tool_name = "content_discovery.run_disc_kick";
+                kick_id.domain = ctx->config.target_url;
+                auto kick_admission = mcp_standalone::downstream::scoped_admission_t::acquire(kick_id);
+                if (!kick_admission.active()) {
+                    diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-REJECT id=%llu reason=%s quota=%s observed=%zu limit=%zu phase=kick",
+                        static_cast<unsigned long long>(ctx->id),
+                        kick_admission.result().reason.c_str(),
+                        kick_admission.result().quota_name.c_str(),
+                        kick_admission.result().observed, kick_admission.result().limit);
+                    continue;
+                }
+                kick_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(kick_admission));
             }
-            const uint64_t kick_token = kick_admission.token();
-            auto kick_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(kick_admission));
+            const uint64_t kick_token = kick_admission_ptr->token();
             const bool kick_posted = [&]() {
                 ::aida::infra::executor::submission_t sub;
                 sub.owner_subsystem = "burp.content_discovery";
@@ -882,46 +914,39 @@ uint64_t start(const config_t& cfg)
                 sub.domain = aida::infra::executor::domain_t::feature_worker;
                 sub.priority = 3;
                 sub.body = [ctx, kick_admission_ptr, kick_token]() {
-                    run_disc(ctx);
-                    diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed phase=kick",
-                        static_cast<unsigned long long>(ctx->id),
-                        static_cast<unsigned long long>(kick_token));
-                    kick_admission_ptr->release("completed");
+                    const bool transferred = run_disc(ctx, kick_admission_ptr);
+                    if (!transferred) {
+                        diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed phase=kick",
+                            static_cast<unsigned long long>(ctx->id),
+                            static_cast<unsigned long long>(kick_token));
+                        kick_admission_ptr->release("completed");
+                    }
                 };
                 return ::aida::infra::executor::submit(std::move(sub)).submitted;
             }();
-            if (kick_posted)
+            if (kick_posted) {
                 ++posted_kicks;
+                if (kick_admission_ptr == start_admission_ptr)
+                    start_admission_transferred = true;
+            }
         }
         if (posted_kicks == 0) {
-            std::unique_lock<std::timed_mutex> lk(ctx->mtx, std::defer_lock);
-            if (lk.try_lock_for(std::chrono::milliseconds(kRunLockTimeoutMs))) {
-                ctx->phase.store(disc_phase_t::error, std::memory_order_release);
-                ctx->last_error = "executor post failed";
-                ctx->finished_unix_ms.store(now_ms(), std::memory_order_release);
-            }
-            ctx->finished.store(true, std::memory_order_release);
+            terminalize(ctx, disc_phase_t::error, "worker admission or executor submission rejected", false);
             diag::log_tagged_fmt("content_discovery", "start_worker_posts_failed id=%llu kick=%d",
                 static_cast<unsigned long long>(ctx->id),
                 kick);
         }
-        diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed phase=start_outer",
-            static_cast<unsigned long long>(ctx->id),
-            static_cast<unsigned long long>(start_token));
-        start_admission_ptr->release("completed");
+        if (!start_admission_transferred) {
+            diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed phase=start_outer",
+                static_cast<unsigned long long>(ctx->id),
+                static_cast<unsigned long long>(start_token));
+            start_admission_ptr->release("completed");
+        }
     };
         return ::aida::infra::executor::submit(std::move(sub)).submitted;
     }();
     if (!posted) {
-        {
-            std::unique_lock<std::timed_mutex> lk(ctx->mtx, std::defer_lock);
-            if (lk.try_lock_for(std::chrono::milliseconds(kRunLockTimeoutMs))) {
-                ctx->phase.store(disc_phase_t::error, std::memory_order_release);
-                ctx->last_error = "executor post failed";
-                ctx->finished_unix_ms.store(now_ms(), std::memory_order_release);
-            }
-        }
-        ctx->finished.store(true, std::memory_order_release);
+        terminalize(ctx, disc_phase_t::error, "executor post failed", false);
         set_err("executor post failed");
         diag::log_tagged_fmt("content_discovery", "start_post_failed id=%llu target=%s",
             static_cast<unsigned long long>(ctx->id),
@@ -949,6 +974,9 @@ disc_status_t snapshot_contention_status(const std::shared_ptr<disc_t>& ctx, con
     out.errors = ctx->errors.load(std::memory_order_acquire);
     out.started_unix_ms = ctx->started_unix_ms.load(std::memory_order_acquire);
     out.finished_unix_ms = ctx->finished_unix_ms.load(std::memory_order_acquire);
+    out.finished = ctx->finished.load(std::memory_order_acquire);
+    out.cancelled = out.finished && ctx->stop_flag.load(std::memory_order_acquire) &&
+        out.phase == disc_phase_t::complete;
     out.calibrated_size_lo = ctx->calibrated_lo.load(std::memory_order_acquire);
     out.calibrated_size_hi = ctx->calibrated_hi.load(std::memory_order_acquire);
     out.config = ctx->config;
@@ -980,6 +1008,9 @@ void fill_status_locked(const std::shared_ptr<disc_t>& ctx, disc_status_t& out)
     out.errors = ctx->errors.load(std::memory_order_acquire);
     out.started_unix_ms = ctx->started_unix_ms.load(std::memory_order_acquire);
     out.finished_unix_ms = ctx->finished_unix_ms.load(std::memory_order_acquire);
+    out.finished = ctx->finished.load(std::memory_order_acquire);
+    out.cancelled = out.finished && ctx->stop_flag.load(std::memory_order_acquire) &&
+        out.phase == disc_phase_t::complete;
     out.calibrated_size_lo = ctx->calibrated_lo.load(std::memory_order_acquire);
     out.calibrated_size_hi = ctx->calibrated_hi.load(std::memory_order_acquire);
     out.last_error = ctx->last_error;
@@ -1029,6 +1060,8 @@ bool stop(uint64_t id)
         if (ctx->phase.load(std::memory_order_acquire) != disc_phase_t::complete)
             ctx->phase.store(disc_phase_t::stopping, std::memory_order_release);
     }
+    if (ctx->in_flight.load(std::memory_order_acquire) == 0)
+        terminalize(ctx, disc_phase_t::complete, "cancelled", true);
     diag::log_tagged_fmt("burp.content_discovery", "disc_stop id=%llu", static_cast<unsigned long long>(id));
     return true;
 }

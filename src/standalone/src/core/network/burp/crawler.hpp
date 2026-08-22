@@ -60,6 +60,8 @@ struct crawl_status_t
     uint64_t                       last_progress_unix_ms = 0;
     double                         pages_per_sec = 0.0;
     int                            in_flight = 0;
+    bool                           finished = false;
+    bool                           cancelled = false;
     std::string                    last_url;
     std::string                    last_error;
     crawl_config_t                 config;

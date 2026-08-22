@@ -165,6 +165,8 @@ struct submit_result_t {
 
 struct wait_result_t {
     bool completed = false;
+    bool cancelled = false;
+    bool failed = false;
     bool timed_out = false;
     bool rejected = false;
 };
@@ -537,7 +539,9 @@ inline wait_result_t wait_for(std::uint64_t task_id, std::uint32_t timeout_ms) {
         return result;
     }
     auto rt = aida::infra::taskflow_runtime::wait_for(task_id, timeout_ms);
-    result.completed = rt.completed || rt.cancelled || rt.failed;
+    result.completed = rt.completed;
+    result.cancelled = rt.cancelled;
+    result.failed = rt.failed;
     result.timed_out = rt.timed_out;
     result.rejected = rt.rejected;
     if (rt.timed_out) {
@@ -602,7 +606,7 @@ inline void check_deadlines() {
     }
 }
 
-inline bool shutdown() {
+inline bool shutdown(std::uint32_t timeout_ms = 15000) {
     const bool first_request = !g_shutdown_requested.exchange(true, std::memory_order_acq_rel);
     auto snap = active_snapshot();
     if (first_request) diag::log_tagged_fmt("executor",
@@ -643,7 +647,7 @@ inline bool shutdown() {
             static_cast<unsigned long long>(job.deadline_ms),
             static_cast<unsigned long long>(job.active_ms));
     }
-    const bool complete = aida::infra::taskflow_runtime::shutdown();
+    const bool complete = aida::infra::taskflow_runtime::shutdown(timeout_ms);
     diag::log_tagged_fmt("executor",
         complete ? "EXECUTOR-SHUTDOWN-COMPLETE tid=%lu"
             : "EXECUTOR-SHUTDOWN-DEFERRED tid=%lu",

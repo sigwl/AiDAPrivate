@@ -5,7 +5,9 @@
 #include <winternl.h>
 
 #include "debugger_engine.hpp"
+#include "debugger_interaction_context.hpp"
 #include "standalone_driver.hpp"
+#include "standalone_driver_identity.hpp"
 #include "zydis_disasm.hpp"
 #include "stealth_engine.hpp"
 #include "../analysis/symbol_store.hpp"
@@ -62,12 +64,13 @@ namespace debugger_engine {
 namespace {
 
 std::string& last_error_ref() {
-	static std::string s_last_error;
+	static thread_local std::string s_last_error;
 	return s_last_error;
 }
 
 void set_last_error(const std::string& msg) {
-	last_error_ref() = msg;
+	std::lock_guard<std::mutex> lk(g_state.error_mtx);
+	g_state.error_text = msg;
 }
 
 std::mutex& breakpoint_mutation_mutex() {
@@ -1403,6 +1406,26 @@ void release_step_suspend_if_previously_suspended(uint32_t tid, uint32_t previou
 	}
 }
 
+void release_acquired_step_suspend(uint32_t tid, uint32_t previous_suspend_count) {
+	if (tid != 0) {
+		uint32_t prev = 0;
+		const bool ok = driver_bridge::resume_thread(tid, &prev);
+		diag::log_tagged_fmt("debugger",
+			"release_acquired_step_suspend tid=%u previous_suspend=%u resume_ok=%d resume_prev=%u",
+			static_cast<unsigned>(tid),
+			static_cast<unsigned>(previous_suspend_count),
+			ok ? 1 : 0,
+			static_cast<unsigned>(prev));
+	}
+}
+
+dbg_status_t step_status_after_suspend_release(uint32_t previous_suspend_count)
+{
+	if (previous_suspend_count > 0)
+		return dbg_status_t::paused;
+	return driver_bridge::attached_process_alive() ? dbg_status_t::running : dbg_status_t::terminated;
+}
+
 }
 
 std::string call_stack_frame_resolver_evidence(uint64_t address) {
@@ -1495,16 +1518,56 @@ namespace {
 
 aida::events::subscription_handle_t g_process_exited_sub;
 std::atomic<bool> g_event_subscriptions_initialized{false};
+std::mutex g_spawn_resources_mutex;
+std::unordered_map<std::uint32_t, run_target::launch_result_t> g_spawn_resources;
 
 void handle_process_exited(const aida::events::process_exited_t& evt) {
+	run_target::launch_result_t exited_resources;
+	bool has_resources = false;
+	{
+		std::lock_guard<std::mutex> lk(g_spawn_resources_mutex);
+		auto it = g_spawn_resources.find(evt.process_id);
+		if (it != g_spawn_resources.end()
+			&& it->second.process_handle != 0
+			&& WaitForSingleObject(reinterpret_cast<HANDLE>(it->second.process_handle), 0) == WAIT_OBJECT_0) {
+			exited_resources = std::move(it->second);
+			g_spawn_resources.erase(it);
+			has_resources = true;
+		}
+	}
+	if (has_resources) {
+		const bool cleaned = run_target::cleanup(exited_resources);
+		diag::log_tagged_fmt("dbg_engine",
+			"process_exited_spawn_resources_cleanup pid=%u ok=%d error='%s'",
+			static_cast<unsigned>(evt.process_id), cleaned ? 1 : 0,
+			exited_resources.error.c_str());
+	}
+	std::unique_lock<std::mutex> mutation_lock(breakpoint_mutation_mutex());
 	uint32_t attached = driver_bridge::attached_pid();
 	if (attached == 0 || attached != evt.process_id)
 		return;
+	uint32_t exit_code = 0;
+	if (driver_bridge::attached_process_alive(&exit_code)) {
+		diag::log_tagged_fmt("dbg_engine",
+			"process_exited_ignored_live_pid pid=%u exit_code=%u reason=pid_reused_or_stale_event",
+			static_cast<unsigned>(evt.process_id),
+			static_cast<unsigned>(exit_code));
+		return;
+	}
+	const bool cleared = driver_bridge::clear_active_pid();
+	diag::log_tagged_fmt("dbg_engine",
+		"process_exited_clear_active_pid pid=%u cleared=%d exit_code=%u driver_pid_after=%u",
+		static_cast<unsigned>(evt.process_id),
+		cleared ? 1 : 0,
+		static_cast<unsigned>(exit_code),
+		static_cast<unsigned>(driver_bridge::attached_pid()));
 
 	auto& st = g_state;
 	st.status.store(dbg_status_t::terminated);
+	st.target_pid = 0;
 	st.active_tid = 0;
 	st.tracing.store(false);
+	debugger_interaction::advance_stop_generation();
 
 	{
 		std::lock_guard<std::mutex> lk(st.bp_mutex);
@@ -1581,6 +1644,15 @@ void shutdown() {
 	while (!st.worker_thread_done.load(std::memory_order_acquire))
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	clear_all_breakpoints();
+	std::vector<run_target::launch_result_t> resources;
+	{
+		std::lock_guard<std::mutex> lk(g_spawn_resources_mutex);
+		for (auto& entry : g_spawn_resources)
+			resources.push_back(std::move(entry.second));
+		g_spawn_resources.clear();
+	}
+	for (auto& resource : resources)
+		(void)run_target::cleanup(resource);
 	diag::log_tagged_fmt("dbg_engine", "shutdown: done");
 }
 
@@ -2425,6 +2497,7 @@ bool spawn_and_attach_target(const run_target::launch_options_t& opts,
 		"spawn_pre_run_target_launch exe='%s' args='%.160s'",
 		exe_utf8.c_str(), args_utf8.c_str());
 	if (!run_target::launch(opts, lr)) {
+		if (out_result) *out_result = lr;
 		set_last_error(lr.error.empty() ? std::string("launch failed (no detail)") : lr.error);
 		diag::log_tagged_critical_fmt("spawn",
 			"spawn_launch_FAILED iso=%d err='%s' elapsed_ms=%llu",
@@ -2457,6 +2530,7 @@ bool spawn_and_attach_target(const run_target::launch_options_t& opts,
 			HANDLE p = reinterpret_cast<HANDLE>(lr.process_handle);
 			if (p) TerminateProcess(p, 0xDEADu);
 			run_target::cleanup(lr);
+			if (out_result) *out_result = lr;
 			return false;
 		}
 	}
@@ -2505,6 +2579,7 @@ bool spawn_and_attach_target(const run_target::launch_options_t& opts,
 			HANDLE p = reinterpret_cast<HANDLE>(lr.process_handle);
 			if (p) TerminateProcess(p, 0xDEADu);
 			run_target::cleanup(lr);
+			if (out_result) *out_result = lr;
 			return false;
 		}
 		diag::log_tagged_critical_fmt("spawn",
@@ -2549,34 +2624,65 @@ bool spawn_and_attach_target(const run_target::launch_options_t& opts,
 	toast_notification::push(ok_msg, toast_notification::toast_type_t::info);
 
 	if (out_pid) *out_pid = lr.pid;
+	const std::uint32_t spawned_pid = lr.pid;
 
-	HANDLE p_handle = reinterpret_cast<HANDLE>(lr.process_handle);
 	HANDLE t_handle = reinterpret_cast<HANDLE>(lr.thread_handle);
-	if (out_result) {
-		*out_result = lr;
-		lr.process_handle = 0;
-		lr.thread_handle = 0;
-		lr.job_handle = 0;
-		lr.firewall_rule_name.clear();
-	} else {
+	if (lr.pid != 0) {
 		if (t_handle) {
 			CloseHandle(t_handle);
 			lr.thread_handle = 0;
 		}
-		if (p_handle) {
-			CloseHandle(p_handle);
-			lr.process_handle = 0;
+		if (out_result) {
+			*out_result = lr;
+			out_result->process_handle = 0;
+			out_result->thread_handle = 0;
+			out_result->job_handle = 0;
+			out_result->firewall_rule_name.clear();
+			out_result->sandbox_pid_registered = false;
+			out_result->net_logger_registered = false;
+			out_result->appcontainer_profile_name.clear();
 		}
-		if (lr.job_handle != 0) {
-			diag::log_tagged_critical_fmt("spawn",
-				"spawn_owns_job job=%p kill_on_host_exit=%d (handle kept open intentionally)",
-				reinterpret_cast<void*>(lr.job_handle),
-				opts.kill_on_host_exit ? 1 : 0);
+		run_target::launch_result_t previous_resources;
+		bool had_previous_resources = false;
+		bool process_already_exited = false;
+		{
+			std::lock_guard<std::mutex> lk(g_spawn_resources_mutex);
+			auto previous = g_spawn_resources.find(lr.pid);
+			if (previous != g_spawn_resources.end()) {
+				previous_resources = std::move(previous->second);
+				g_spawn_resources.erase(previous);
+				had_previous_resources = true;
+			}
+			g_spawn_resources.emplace(lr.pid, std::move(lr));
 		}
-		if (!lr.firewall_rule_name.empty()) {
-			diag::log_tagged_critical_fmt("spawn",
-				"spawn_firewall_rule_persisted name='%s' (manual cleanup: netsh advfirewall firewall delete rule name=\"%s\")",
-				lr.firewall_rule_name.c_str(), lr.firewall_rule_name.c_str());
+		if (had_previous_resources)
+			(void)run_target::cleanup(previous_resources);
+		{
+			std::lock_guard<std::mutex> lk(g_spawn_resources_mutex);
+			auto current = g_spawn_resources.find(spawned_pid);
+			if (current != g_spawn_resources.end()
+				&& WaitForSingleObject(reinterpret_cast<HANDLE>(current->second.process_handle), 0) == WAIT_OBJECT_0) {
+				process_already_exited = true;
+			}
+		}
+		if (process_already_exited) {
+			run_target::launch_result_t exited_resources;
+			{
+				std::lock_guard<std::mutex> lk(g_spawn_resources_mutex);
+				auto current = g_spawn_resources.find(spawned_pid);
+				if (current != g_spawn_resources.end()) {
+					exited_resources = std::move(current->second);
+					g_spawn_resources.erase(current);
+				}
+			}
+			(void)run_target::cleanup(exited_resources);
+		}
+	} else {
+		if (out_result) {
+			*out_result = lr;
+			lr = run_target::launch_result_t{};
+		} else {
+			(void)run_target::cleanup(lr);
 		}
 	}
 
@@ -2663,6 +2769,7 @@ bool step_into() {
 		static_cast<unsigned long long>(pre_step_rip));
 
 	int rearm_bp_index = -1;
+	uint64_t rearm_bp_identity = 0;
 	uint64_t rearm_bp_address = 0;
 	uint8_t  rearm_bp_original = 0;
 	{
@@ -2676,6 +2783,7 @@ bool step_into() {
 			if (bp.address != pre_step_rip) continue;
 			if (bp.byte_written) continue;
 			rearm_bp_index = static_cast<int>(i);
+			rearm_bp_identity = bp.mutation_identity;
 			rearm_bp_address = bp.address;
 			rearm_bp_original = bp.original_byte;
 			break;
@@ -2759,7 +2867,8 @@ bool step_into() {
 					static_cast<unsigned long long>(original_step_ctx.rsp),
 					static_cast<unsigned>(previous_suspend_count));
 				set_last_error("step_into: context-only step set_thread_context failed");
-				st.status.store(dbg_status_t::paused);
+				release_acquired_step_suspend(st.active_tid, previous_suspend_count);
+				st.status.store(step_status_after_suspend_release(previous_suspend_count));
 				return false;
 			}
 			auto post_regs = capture_registers_from_context(kctx);
@@ -2813,13 +2922,17 @@ bool step_into() {
 			static_cast<unsigned long long>(original_step_ctx.rsp),
 			static_cast<unsigned>(previous_suspend_count));
 		set_last_error("step_into: set_thread_context failed");
-		st.status.store(dbg_status_t::paused);
+		release_acquired_step_suspend(st.active_tid, previous_suspend_count);
+		st.status.store(step_status_after_suspend_release(previous_suspend_count));
 		return false;
 	}
 
 	if (!resume_thread_for_controlled_run(st.active_tid, previous_suspend_count)) {
+		driver_bridge::set_thread_context(st.active_tid, original_step_ctx, ctx_mask_base);
+		release_acquired_step_suspend(st.active_tid, previous_suspend_count);
 		set_last_error("step_into: resume_thread failed");
-		st.status.store(dbg_status_t::paused);
+		st.status.store(driver_bridge::attached_process_alive() ?
+			dbg_status_t::running : dbg_status_t::terminated);
 		return false;
 	}
 	diag::log_tagged_fmt("debugger",
@@ -2848,7 +2961,8 @@ bool step_into() {
 		last_probe_rsp = probe.rsp;
 		last_probe_rflags = probe.rflags;
 		if (probe.rip != pre_step_rip) {
-			if (!driver_bridge::suspend_thread(st.active_tid)) {
+			uint32_t probe_previous_suspend = 0;
+			if (!driver_bridge::suspend_thread(st.active_tid, &probe_previous_suspend)) {
 				diag::log_tagged_fmt("debugger",
 					"step_into_probe_advanced_suspend_failed pid=%u tid=%u probe_rip=0x%llx",
 					static_cast<unsigned>(st.target_pid),
@@ -2859,9 +2973,10 @@ bool step_into() {
 			driver_bridge::thread_context_t stable{};
 			if (driver_bridge::get_thread_context(st.active_tid, stable)) {
 				stable.rflags &= ~0x100ULL;
-				driver_bridge::set_thread_context(st.active_tid, stable, ctx_mask_base);
+				const bool stable_context_set = driver_bridge::set_thread_context(
+					st.active_tid, stable, ctx_mask_base);
 				post_regs = capture_registers_from_context(stable);
-				advanced = true;
+				advanced = stable_context_set;
 				diag::log_tagged_fmt("debugger",
 					"step_into_probe_advanced_stable pid=%u tid=%u pre_rip=0x%llx stable_rip=0x%llx stable_rsp=0x%llx stable_rflags=0x%llx probes=%u",
 					static_cast<unsigned>(st.target_pid),
@@ -2871,32 +2986,52 @@ bool step_into() {
 					static_cast<unsigned long long>(stable.rsp),
 					static_cast<unsigned long long>(stable.rflags),
 					static_cast<unsigned>(probe_count));
-				break;
+				if (advanced) {
+					if (probe_previous_suspend > 0)
+						release_acquired_step_suspend(st.active_tid, probe_previous_suspend);
+					break;
+				}
+				release_acquired_step_suspend(st.active_tid, probe_previous_suspend);
+				continue;
 			}
 			probe.rflags &= ~0x100ULL;
-			driver_bridge::set_thread_context(st.active_tid, probe, ctx_mask_base);
+			const bool probe_context_set = driver_bridge::set_thread_context(
+				st.active_tid, probe, ctx_mask_base);
 			post_regs = capture_registers_from_context(probe);
-			advanced = true;
+			advanced = probe_context_set;
 			diag::log_tagged_fmt("debugger",
 				"step_into_probe_advanced_using_probe_context pid=%u tid=%u probe_rip=0x%llx",
 				static_cast<unsigned>(st.target_pid),
 				static_cast<unsigned>(st.active_tid),
 				static_cast<unsigned long long>(probe.rip));
-			break;
+			if (advanced)
+				break;
+			release_acquired_step_suspend(st.active_tid, probe_previous_suspend);
 		}
 	}
 
 	if (!advanced) {
-		driver_bridge::suspend_thread(st.active_tid);
+		uint32_t timeout_previous_suspend = 0;
+		const bool timeout_suspend_ok = driver_bridge::suspend_thread(
+			st.active_tid, &timeout_previous_suspend);
 		driver_bridge::thread_context_t restore_ctx{};
-		if (driver_bridge::get_thread_context(st.active_tid, restore_ctx)) {
+		bool timeout_context_ok = false;
+		bool timeout_restore_ok = false;
+		if (timeout_suspend_ok && driver_bridge::get_thread_context(st.active_tid, restore_ctx)) {
+			timeout_context_ok = true;
 			restore_ctx.rflags &= ~0x100ULL;
-			driver_bridge::set_thread_context(st.active_tid, restore_ctx, ctx_mask_base);
+			timeout_restore_ok = driver_bridge::set_thread_context(
+				st.active_tid, restore_ctx, ctx_mask_base);
 		}
-		st.status.store(dbg_status_t::paused);
+		const bool timeout_cleanup_verified = timeout_suspend_ok && timeout_context_ok &&
+			timeout_restore_ok;
+		if (timeout_suspend_ok && !timeout_cleanup_verified)
+			release_acquired_step_suspend(st.active_tid, timeout_previous_suspend);
 		set_last_error("step_into: thread did not advance within timeout");
 		uint32_t exit_code = 0;
 		const bool alive = driver_bridge::attached_process_alive(&exit_code);
+		st.status.store(timeout_cleanup_verified ? dbg_status_t::paused :
+			(alive ? dbg_status_t::running : dbg_status_t::terminated));
 		diag::log_tagged_fmt("debugger",
 			"step_into_TIMEOUT pid=%u tid=%u pre_rip=0x%llx last_probe_rip=0x%llx last_probe_rsp=0x%llx last_probe_rflags=0x%llx probes=%u timeout_ms=%u alive=%d exit_code=0x%08X",
 			static_cast<unsigned>(st.target_pid),
@@ -2921,12 +3056,16 @@ bool step_into() {
 
 	if (rearm_bp_index >= 0 && post_regs.rip != rearm_bp_address) {
 		std::vector<uint8_t> cc{0xCC};
-		if (driver_bridge::write_memory(rearm_bp_address, cc)) {
+		std::unique_lock<std::mutex> mutation_lock(breakpoint_mutation_mutex());
+		if (driver_bridge::attached_pid() == st.target_pid &&
+			driver_bridge::write_memory(rearm_bp_address, cc)) {
 			std::lock_guard<std::mutex> lk(st.bp_mutex);
-			if (rearm_bp_index < static_cast<int>(st.breakpoints.size()) &&
-				st.breakpoints[static_cast<size_t>(rearm_bp_index)].address == rearm_bp_address) {
-				st.breakpoints[static_cast<size_t>(rearm_bp_index)].byte_written = true;
-				st.breakpoints[static_cast<size_t>(rearm_bp_index)].original_byte = rearm_bp_original;
+			auto row = find_breakpoint_identity(st, rearm_bp_identity);
+			if (row != st.breakpoints.end() &&
+				row->address == rearm_bp_address &&
+				row->install_state == breakpoint_install_state_t::installed) {
+				row->byte_written = true;
+				row->original_byte = rearm_bp_original;
 				st.breakpoints_generation.fetch_add(1, std::memory_order_release);
 			}
 		}
@@ -3025,14 +3164,15 @@ bool step_out() {
 		driver_bridge::thread_context_t kctx{};
 		if (!suspend_contextable_thread(st, kctx, previous_suspend_count)) {
 			set_last_error("step_out: no contextable target thread");
-			st.status.store(dbg_status_t::paused);
+			st.status.store(step_status_after_suspend_release(previous_suspend_count));
 			return false;
 		}
 		selected_tid = st.active_tid;
+		driver_bridge::thread_context_t original_step_ctx = kctx;
 
 		std::vector<uint8_t> ret_buf;
 		if (!driver_bridge::read_memory(kctx.rsp, 8, ret_buf) || ret_buf.size() < 8) {
-			release_step_suspend_if_previously_suspended(selected_tid, previous_suspend_count);
+			release_acquired_step_suspend(selected_tid, previous_suspend_count);
 			set_last_error("step_out: stack read failed");
 			st.status.store(dbg_status_t::paused);
 			diag::log_tagged_fmt("debugger",
@@ -3066,7 +3206,8 @@ bool step_out() {
 						static_cast<unsigned long long>(kctx.rsp),
 						static_cast<unsigned>(previous_suspend_count));
 					set_last_error("step_out: return context set_thread_context failed");
-					st.status.store(dbg_status_t::paused);
+					release_acquired_step_suspend(selected_tid, previous_suspend_count);
+					st.status.store(step_status_after_suspend_release(previous_suspend_count));
 					return false;
 				}
 				auto post_regs = capture_registers_from_context(kctx);
@@ -3089,8 +3230,11 @@ bool step_out() {
 		}
 
 		if (!resume_thread_for_controlled_run(selected_tid, previous_suspend_count)) {
+			driver_bridge::set_thread_context(selected_tid, original_step_ctx, ctx_mask_base);
+			release_acquired_step_suspend(selected_tid, previous_suspend_count);
 			set_last_error("step_out: resume_thread failed");
-			st.status.store(dbg_status_t::paused);
+			st.status.store(driver_bridge::attached_process_alive() ?
+				dbg_status_t::running : dbg_status_t::terminated);
 			return false;
 		}
 	}
@@ -3383,7 +3527,7 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 		hit_suspend_ok = driver_bridge::suspend_thread(hit_tid, &hit_previous_suspend);
 		const DWORD hit_suspend_gle = hit_suspend_ok ? ERROR_SUCCESS : GetLastError();
 		driver_bridge::thread_context_t hit_ctx{};
-		if (hit_suspend_ok) {
+			if (hit_suspend_ok) {
 			hit_context_ok = driver_bridge::get_thread_context(hit_tid, hit_ctx);
 			hit_final_rip = hit_ctx.rip;
 			hit_final_rsp = hit_ctx.rsp;
@@ -3410,7 +3554,18 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 			static_cast<unsigned long long>(hit_final_rsp),
 			static_cast<unsigned long long>(hit_final_rflags),
 			hit_adjusted ? 1 : 0,
-			static_cast<unsigned long long>(address));
+				static_cast<unsigned long long>(address));
+	}
+	if (reached && (!hit_suspend_ok || !hit_context_ok ||
+		(hit_final_rip == address + 1 && !hit_adjusted))) {
+		if (hit_suspend_ok)
+			release_acquired_step_suspend(hit_tid, hit_previous_suspend);
+		set_last_error("run_to_address: failed to stop hit thread");
+		uint32_t exit_code = 0;
+		const bool alive = driver_bridge::attached_process_alive(&exit_code);
+		st.status.store(alive ? dbg_status_t::running : dbg_status_t::terminated);
+		invalidate_cache();
+		return false;
 	}
 
 	struct suspended_cleanup_thread_t {
@@ -3419,6 +3574,8 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 		bool suspend_ok = false;
 		bool context_ok = false;
 		bool adjusted = false;
+		bool restore_ok = false;
+		bool resume_ok = false;
 		uint64_t rip = 0;
 		uint64_t rsp = 0;
 		uint64_t rflags = 0;
@@ -3445,21 +3602,37 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 					item.adjusted = driver_bridge::set_thread_context(th.tid, kctx, ctx_mask_base);
 					item.rip = kctx.rip;
 				}
+				if (item.context_ok) {
+					kctx.rflags &= ~0x100ULL;
+					item.restore_ok = driver_bridge::set_thread_context(
+						th.tid, kctx, ctx_mask_base);
+				}
+				uint32_t resume_previous = 0;
+				item.resume_ok = driver_bridge::resume_thread(th.tid, &resume_previous);
 			}
 			diag::log_tagged_fmt("debugger",
-				"run_to_address_timeout_suspend pid=%u tid=%u suspend_ok=%d previous_suspend=%u gle=%lu context_ok=%d rip=0x%llx rsp=0x%llx rflags=0x%llx adjusted=%d",
+				"run_to_address_timeout_suspend pid=%u tid=%u suspend_ok=%d previous_suspend=%u gle=%lu context_ok=%d restore_ok=%d resume_ok=%d rip=0x%llx rsp=0x%llx rflags=0x%llx adjusted=%d",
 				static_cast<unsigned>(target_pid),
 				static_cast<unsigned>(item.tid),
 				item.suspend_ok ? 1 : 0,
 				static_cast<unsigned>(item.previous_suspend),
 				static_cast<unsigned long>(suspend_gle),
 				item.context_ok ? 1 : 0,
+				item.restore_ok ? 1 : 0,
+				item.resume_ok ? 1 : 0,
 				static_cast<unsigned long long>(item.rip),
 				static_cast<unsigned long long>(item.rsp),
 				static_cast<unsigned long long>(item.rflags),
 				item.adjusted ? 1 : 0);
 			cleanup_threads.push_back(item);
 		}
+	}
+	bool timeout_cleanup_verified = cleanup_threads.empty();
+	for (const auto& item : cleanup_threads) {
+		if (item.suspend_ok && (!item.context_ok || !item.restore_ok || !item.resume_ok))
+			timeout_cleanup_verified = false;
+		if (!item.suspend_ok)
+			timeout_cleanup_verified = false;
 	}
 
 	bool restore_attempted = false;
@@ -3468,6 +3641,7 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 	int internal_removed = 0;
 	int public_removed = 0;
 	{
+		std::unique_lock<std::mutex> mutation_lock(breakpoint_mutation_mutex());
 		std::lock_guard<std::mutex> lk(st.bp_mutex);
 		for (auto it = st.internal_breakpoints.begin(); it != st.internal_breakpoints.end(); ) {
 			if (it->address == address && it->active) {
@@ -3476,6 +3650,8 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 				restore_attempted = true;
 				restore_ok = driver_bridge::write_memory(address, restore);
 				restore_gle = restore_ok ? ERROR_SUCCESS : GetLastError();
+				if (!restore_ok)
+					break;
 				it = st.internal_breakpoints.erase(it);
 				++internal_removed;
 			} else {
@@ -3507,14 +3683,14 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 
 	if (!reached) {
 		set_last_error("run_to_address: timed out waiting for trap");
-		st.status.store(dbg_status_t::paused);
 		invalidate_cache();
 		uint32_t exit_after = 0;
 		const bool alive_after = driver_bridge::attached_process_alive(&exit_after);
+		st.status.store(alive_after ? dbg_status_t::running : dbg_status_t::terminated);
 		const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 			std::chrono::steady_clock::now() - wait_start).count();
 		diag::log_tagged_fmt("debugger",
-			"run_to_address_TIMEOUT pid=%u active_tid=%u addr=0x%llx timeout_ms=%u elapsed_ms=%lld probes=%u context_ok=%u context_fail=%u last_tid=%u last_rip=0x%llx last_rsp=0x%llx last_rflags=0x%llx cleanup_suspended=%zu restore_ok=%d alive=%d exit_code=0x%08X",
+			"run_to_address_TIMEOUT pid=%u active_tid=%u addr=0x%llx timeout_ms=%u elapsed_ms=%lld probes=%u context_ok=%u context_fail=%u last_tid=%u last_rip=0x%llx last_rsp=0x%llx last_rflags=0x%llx cleanup_suspended=%zu cleanup_verified=%d restore_ok=%d alive=%d exit_code=0x%08X",
 			static_cast<unsigned>(target_pid),
 			static_cast<unsigned>(st.active_tid),
 			static_cast<unsigned long long>(address),
@@ -3528,20 +3704,26 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 			static_cast<unsigned long long>(last_probe_rsp),
 			static_cast<unsigned long long>(last_probe_rflags),
 			cleanup_threads.size(),
+			timeout_cleanup_verified ? 1 : 0,
 			restore_ok ? 1 : 0,
 			alive_after ? 1 : 0,
 			static_cast<unsigned>(exit_after));
 		return false;
 	}
 
+	uint32_t exit_after = 0;
+	const bool alive_after = driver_bridge::attached_process_alive(&exit_after);
+	if (hit_tid != 0 && (!hit_suspend_ok || !hit_context_ok || (hit_final_rip == address + 1 && !hit_adjusted))) {
+		set_last_error("run_to_address: hit thread cleanup was not verified");
+		st.status.store(alive_after ? dbg_status_t::running : dbg_status_t::terminated);
+		return false;
+	}
 	if (hit_tid != 0) {
 		st.active_tid = hit_tid;
 		signal_trap(address);
 	}
 	st.status.store(dbg_status_t::paused);
 	invalidate_cache();
-	uint32_t exit_after = 0;
-	const bool alive_after = driver_bridge::attached_process_alive(&exit_after);
 	const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 		std::chrono::steady_clock::now() - wait_start).count();
 	diag::log_tagged_fmt("debugger",
@@ -4808,7 +4990,10 @@ size_t log_message_count() {
 }
 
 const std::string& last_error() {
-	return last_error_ref();
+	auto& copy = last_error_ref();
+	std::lock_guard<std::mutex> lk(g_state.error_mtx);
+	copy = g_state.error_text;
+	return copy;
 }
 
 
@@ -4817,6 +5002,68 @@ namespace {
 inline uint64_t now_ms() {
 	auto tp = std::chrono::steady_clock::now().time_since_epoch();
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(tp).count());
+}
+
+struct refresh_target_snapshot_t {
+	uint32_t pid = 0;
+	uint64_t stop_generation = 0;
+	driver_bridge::identity::live_target_identity_t identity;
+};
+
+bool capture_refresh_target(refresh_target_snapshot_t& snapshot, const char* refresh_name) {
+	snapshot = {};
+	snapshot.pid = driver_bridge::attached_pid();
+	snapshot.stop_generation = debugger_interaction::current_stop_generation();
+	std::string error;
+	if (snapshot.pid == 0 ||
+		!driver_bridge::identity::capture_live_target_identity(
+			snapshot.pid, 0, snapshot.identity, &error) ||
+		snapshot.identity.process.pid != snapshot.pid ||
+		driver_bridge::attached_pid() != snapshot.pid ||
+		debugger_interaction::current_stop_generation() != snapshot.stop_generation) {
+		diag::log_tagged_fmt("debugger_engine",
+			"%s_target_capture_failed pid=%u stop_generation=%llu attached_pid=%u current_generation=%llu error=%s",
+			refresh_name,
+			snapshot.pid,
+			static_cast<unsigned long long>(snapshot.stop_generation),
+			driver_bridge::attached_pid(),
+			static_cast<unsigned long long>(debugger_interaction::current_stop_generation()),
+			error.empty() ? "target changed during capture" : error.c_str());
+		return false;
+	}
+	return true;
+}
+
+bool refresh_target_current(const refresh_target_snapshot_t& snapshot,
+	const char* refresh_name, const char* phase) {
+	const uint32_t attached_pid = driver_bridge::attached_pid();
+	const uint64_t stop_generation = debugger_interaction::current_stop_generation();
+	if (attached_pid != snapshot.pid || stop_generation != snapshot.stop_generation) {
+		diag::log_tagged_fmt("debugger_engine",
+			"%s_target_stale phase=%s expected_pid=%u attached_pid=%u expected_generation=%llu current_generation=%llu",
+			refresh_name,
+			phase,
+			snapshot.pid,
+			attached_pid,
+			static_cast<unsigned long long>(snapshot.stop_generation),
+			static_cast<unsigned long long>(stop_generation));
+		return false;
+	}
+	const auto validation =
+		driver_bridge::identity::validate_attached_target_identity(snapshot.identity);
+	if (validation.matches)
+		return true;
+	diag::log_tagged_fmt("debugger_engine",
+		"%s_target_stale phase=%s expected_pid=%u attached_pid=%u expected_generation=%llu current_generation=%llu staleness=%s detail=%s",
+		refresh_name,
+		phase,
+		snapshot.pid,
+		attached_pid,
+		static_cast<unsigned long long>(snapshot.stop_generation),
+		static_cast<unsigned long long>(stop_generation),
+		driver_bridge::identity::staleness_code(validation.staleness),
+		validation.detail.empty() ? "<empty>" : validation.detail.c_str());
+	return false;
 }
 
 }
@@ -4931,6 +5178,8 @@ void request_refresh(uint32_t max_age_ms) {
 	auto& st = g_state;
 	sync_attached_state();
 	if (st.target_pid == 0) return;
+	const uint32_t target_pid = st.target_pid;
+	const uint64_t target_stop_generation = debugger_interaction::current_stop_generation();
 	uint64_t now = now_ms();
 	if (now - st.last_refresh_ms.load() < max_age_ms) return;
 	bool expected = false;
@@ -4943,11 +5192,16 @@ void request_refresh(uint32_t max_age_ms) {
 		submission.thread_class = "debugger_refresh";
 		submission.domain = aida::infra::executor::domain_t::feature_worker;
 		submission.priority = 3;
-		submission.target_pid = st.target_pid;
+		submission.target_pid = target_pid;
 		submission.failure_policy = "reject_not_started";
-		submission.body = []() {
+		submission.body = [target_pid, target_stop_generation]() {
 			auto& s = g_state;
 			try {
+				if (driver_bridge::attached_pid() != target_pid ||
+					debugger_interaction::current_stop_generation() != target_stop_generation) {
+					s.refresh_in_flight.store(false);
+					return;
+				}
 				if (s.active_tid == 0 && s.target_pid != 0) {
 					auto threads = driver_bridge::enumerate_threads();
 					for (const auto& th : threads) {
@@ -4958,6 +5212,11 @@ void request_refresh(uint32_t max_age_ms) {
 					}
 				}
 				register_set_t fresh = get_registers();
+				if (driver_bridge::attached_pid() != target_pid ||
+					debugger_interaction::current_stop_generation() != target_stop_generation) {
+					s.refresh_in_flight.store(false);
+					return;
+				}
 				{
 					std::lock_guard<std::mutex> lk(s.cache_mtx);
 					s.cached_regs = fresh;
@@ -4987,6 +5246,8 @@ void request_thread_refresh(uint32_t max_age_ms) {
 	auto& st = g_state;
 	sync_attached_state();
 	if (st.target_pid == 0) return;
+	const uint32_t target_pid = st.target_pid;
+	const uint64_t target_stop_generation = debugger_interaction::current_stop_generation();
 	uint64_t now = now_ms();
 	if (now - st.last_thread_refresh_ms.load() < max_age_ms) return;
 	bool expected = false;
@@ -4999,11 +5260,16 @@ void request_thread_refresh(uint32_t max_age_ms) {
 		submission.thread_class = "debugger_refresh";
 		submission.domain = aida::infra::executor::domain_t::feature_worker;
 		submission.priority = 3;
-		submission.target_pid = st.target_pid;
+		submission.target_pid = target_pid;
 		submission.failure_policy = "reject_not_started";
-		submission.body = []() {
+		submission.body = [target_pid, target_stop_generation]() {
 			auto& s = g_state;
 			try {
+				if (driver_bridge::attached_pid() != target_pid ||
+					debugger_interaction::current_stop_generation() != target_stop_generation) {
+					s.thread_refresh_in_flight.store(false);
+					return;
+				}
 				auto raw = driver_bridge::enumerate_threads();
 				std::vector<cached_thread_t> entries;
 				entries.reserve(raw.size());
@@ -5017,6 +5283,11 @@ void request_thread_refresh(uint32_t max_age_ms) {
 					e.state = t.state;
 					e.rip = t.rip;
 					entries.push_back(e);
+				}
+				if (driver_bridge::attached_pid() != target_pid ||
+					debugger_interaction::current_stop_generation() != target_stop_generation) {
+					s.thread_refresh_in_flight.store(false);
+					return;
 				}
 				if (s.active_tid == 0 && !entries.empty())
 					s.active_tid = entries.front().tid;
@@ -5051,6 +5322,8 @@ void request_stack_refresh(uint64_t rsp, size_t bytes, uint32_t max_age_ms) {
 	if (rsp == 0 || bytes == 0) return;
 	uint64_t now = now_ms();
 	if (now - st.last_stack_refresh_ms.load() < max_age_ms) return;
+	refresh_target_snapshot_t target;
+	if (!capture_refresh_target(target, "stack_refresh")) return;
 	bool expected = false;
 	if (!st.stack_refresh_in_flight.compare_exchange_strong(expected, true)) return;
 
@@ -5061,19 +5334,21 @@ void request_stack_refresh(uint64_t rsp, size_t bytes, uint32_t max_age_ms) {
 		submission.thread_class = "debugger_refresh";
 		submission.domain = aida::infra::executor::domain_t::feature_worker;
 		submission.priority = 3;
-		submission.target_pid = st.target_pid;
+		submission.target_pid = target.pid;
 		submission.failure_policy = "reject_not_started";
-		submission.body = [rsp, bytes]() {
+		submission.body = [rsp, bytes, target]() {
 			auto& s = g_state;
 			try {
-				std::vector<uint8_t> buf;
-				driver_bridge::read_memory(rsp, bytes, buf);
-				{
-					std::lock_guard<std::mutex> lk(s.cache_mtx);
-					s.cached_stack_addr = rsp;
-					s.cached_stack = std::move(buf);
+				if (refresh_target_current(target, "stack_refresh", "before_read")) {
+					std::vector<uint8_t> buf;
+					driver_bridge::read_memory(rsp, bytes, buf);
+					if (refresh_target_current(target, "stack_refresh", "before_publish")) {
+						std::lock_guard<std::mutex> lk(s.cache_mtx);
+						s.cached_stack_addr = rsp;
+						s.cached_stack = std::move(buf);
+						s.last_stack_refresh_ms.store(now_ms());
+					}
 				}
-				s.last_stack_refresh_ms.store(now_ms());
 			} catch (const std::exception& ex) {
 				diag::log_tagged_fmt("debugger", "request_stack_refresh_worker_exception err='%s'", ex.what());
 			} catch (...) {
@@ -5116,6 +5391,8 @@ void request_dump_refresh(uint64_t addr, size_t bytes, uint32_t max_age_ms) {
 			static_cast<unsigned long long>(addr), bytes, static_cast<unsigned long long>(age), max_age_ms);
 		return;
 	}
+	refresh_target_snapshot_t target;
+	if (!capture_refresh_target(target, "dump_refresh")) return;
 	bool expected = false;
 	if (!st.dump_refresh_in_flight.compare_exchange_strong(expected, true)) {
 		diag::log_tagged_fmt("debugger_engine", "dump_refresh_busy addr=0x%llX bytes=%zu", static_cast<unsigned long long>(addr), bytes);
@@ -5129,9 +5406,9 @@ void request_dump_refresh(uint64_t addr, size_t bytes, uint32_t max_age_ms) {
 		submission.thread_class = "debugger_refresh";
 		submission.domain = aida::infra::executor::domain_t::feature_worker;
 		submission.priority = 2;
-		submission.target_pid = st.target_pid;
+		submission.target_pid = target.pid;
 		submission.failure_policy = "reject_not_started";
-		submission.body = [addr, bytes, now]() {
+		submission.body = [addr, bytes, now, target]() {
 			auto& s = g_state;
 			const uint64_t worker_start = now_ms();
 			diag::log_tagged_fmt("debugger_engine", "dump_refresh_worker_entry addr=0x%llX bytes=%zu request_age_ms=%llu attached_pid=%u",
@@ -5141,18 +5418,22 @@ void request_dump_refresh(uint64_t addr, size_t bytes, uint32_t max_age_ms) {
 				driver_bridge::attached_pid());
 			try {
 				std::vector<uint8_t> buf;
-				SetLastError(ERROR_SUCCESS);
-				const bool read_ok = driver_bridge::read_memory(addr, bytes, buf);
-				const DWORD gle = read_ok ? ERROR_SUCCESS : GetLastError();
+				bool read_ok = false;
+				DWORD gle = ERROR_SUCCESS;
+				if (refresh_target_current(target, "dump_refresh", "before_read")) {
+					SetLastError(ERROR_SUCCESS);
+					read_ok = driver_bridge::read_memory(addr, bytes, buf);
+					gle = read_ok ? ERROR_SUCCESS : GetLastError();
+				}
 				const std::string status = driver_bridge::status();
 				const std::string drv_err = driver_bridge::last_error();
-				{
+				if (refresh_target_current(target, "dump_refresh", "before_publish")) {
 					std::lock_guard<std::mutex> lk(s.cache_mtx);
 					s.cached_dump_addr = addr;
 					s.cached_dump_size = bytes;
 					s.cached_dump = std::move(buf);
+					s.last_dump_refresh_ms.store(now_ms());
 				}
-				s.last_dump_refresh_ms.store(now_ms());
 				size_t cached_size = 0;
 				{
 					std::lock_guard<std::mutex> lk(s.cache_mtx);
@@ -5190,26 +5471,31 @@ void request_dump_refresh(uint64_t addr, size_t bytes, uint32_t max_age_ms) {
 	}
 }
 
-bool refresh_disasm_window_now(uint64_t rip, const char* source) {
+bool refresh_disasm_window_now(uint64_t rip, const char* source,
+	const refresh_target_snapshot_t& target) {
 	auto& s = g_state;
 	uint64_t base = (rip > 0x100) ? rip - 0x100 : 0;
 	std::vector<uint8_t> buf;
 	SetLastError(ERROR_SUCCESS);
 	const uint64_t start = now_ms();
-	bool read_ok = driver_bridge::read_memory(base, 0x400, buf);
+	bool read_ok = false;
+	if (refresh_target_current(target, "disasm_refresh", "before_read"))
+		read_ok = driver_bridge::read_memory(base, 0x400, buf);
 	DWORD gle = read_ok ? ERROR_SUCCESS : GetLastError();
 	const uint64_t elapsed = now_ms() - start;
-	{
+	bool published = false;
+	if (refresh_target_current(target, "disasm_refresh", "before_publish")) {
 		std::lock_guard<std::mutex> lk(s.cache_mtx);
 		s.cached_disasm_base = base;
 		s.cached_disasm_bytes = std::move(buf);
+		s.last_disasm_refresh_ms.store(now_ms());
+		published = true;
 	}
 	size_t cached_size = 0;
 	{
 		std::lock_guard<std::mutex> lk(s.cache_mtx);
 		cached_size = s.cached_disasm_bytes.size();
 	}
-	s.last_disasm_refresh_ms.store(now_ms());
 	s.disasm_refresh_in_flight.store(false);
 	diag::log_tagged_fmt("debugger_engine",
 		"disasm_refresh source=%s pid=%u target_pid=%u rip=0x%llX base=0x%llX size=%u read_ok=%d bytes=%zu gle=%lu elapsed_ms=%llu driver_status=%s driver_error=%s",
@@ -5225,7 +5511,7 @@ bool refresh_disasm_window_now(uint64_t rip, const char* source) {
 		static_cast<unsigned long long>(elapsed),
 		driver_bridge::status().c_str(),
 		driver_bridge::last_error().c_str());
-	return read_ok && cached_size != 0;
+	return published && read_ok && cached_size != 0;
 }
 
 void request_disasm_refresh(uint64_t rip, uint32_t max_age_ms) {
@@ -5233,6 +5519,8 @@ void request_disasm_refresh(uint64_t rip, uint32_t max_age_ms) {
 	if (rip == 0) return;
 	uint64_t now = now_ms();
 	if (now - st.last_disasm_refresh_ms.load() < max_age_ms) return;
+	refresh_target_snapshot_t target;
+	if (!capture_refresh_target(target, "disasm_refresh")) return;
 	bool expected = false;
 	if (!st.disasm_refresh_in_flight.compare_exchange_strong(expected, true)) {
 		if (max_age_ms == 0) {
@@ -5242,13 +5530,13 @@ void request_disasm_refresh(uint64_t rip, uint32_t max_age_ms) {
 				driver_bridge::attached_pid(),
 				st.target_pid);
 			st.disasm_refresh_in_flight.store(true);
-			(void)refresh_disasm_window_now(rip, "forced_sync_recover_inflight");
+			(void)refresh_disasm_window_now(rip, "forced_sync_recover_inflight", target);
 		}
 		return;
 	}
 
 	if (max_age_ms == 0) {
-		(void)refresh_disasm_window_now(rip, "forced_sync");
+		(void)refresh_disasm_window_now(rip, "forced_sync", target);
 		return;
 	}
 
@@ -5259,11 +5547,11 @@ void request_disasm_refresh(uint64_t rip, uint32_t max_age_ms) {
 		submission.thread_class = "debugger_refresh";
 		submission.domain = aida::infra::executor::domain_t::feature_worker;
 		submission.priority = 2;
-		submission.target_pid = st.target_pid;
+		submission.target_pid = target.pid;
 		submission.failure_policy = "reject_not_started";
-		submission.body = [rip]() {
+		submission.body = [rip, target]() {
 			try {
-				(void)refresh_disasm_window_now(rip, "executor");
+				(void)refresh_disasm_window_now(rip, "executor", target);
 			} catch (const std::exception& ex) {
 				g_state.disasm_refresh_in_flight.store(false);
 				set_last_error(std::string("request_disasm_refresh worker exception: ") + ex.what());
@@ -5283,7 +5571,7 @@ void request_disasm_refresh(uint64_t rip, uint32_t max_age_ms) {
 				static_cast<unsigned long long>(rip),
 				driver_bridge::attached_pid(),
 				st.target_pid);
-			(void)refresh_disasm_window_now(rip, "worker_post_failed_sync");
+			(void)refresh_disasm_window_now(rip, "worker_post_failed_sync", target);
 		}
 	} catch (const std::exception& ex) {
 		set_last_error(std::string("request_disasm_refresh worker create failed: ") + ex.what());
@@ -5293,7 +5581,7 @@ void request_disasm_refresh(uint64_t rip, uint32_t max_age_ms) {
 			driver_bridge::attached_pid(),
 			st.target_pid,
 			ex.what());
-		(void)refresh_disasm_window_now(rip, "thread_create_failed_sync");
+		(void)refresh_disasm_window_now(rip, "thread_create_failed_sync", target);
 	} catch (...) {
 		set_last_error("request_disasm_refresh worker create failed");
 		diag::log_tagged_fmt("debugger_engine",
@@ -5301,7 +5589,7 @@ void request_disasm_refresh(uint64_t rip, uint32_t max_age_ms) {
 			static_cast<unsigned long long>(rip),
 			driver_bridge::attached_pid(),
 			st.target_pid);
-		(void)refresh_disasm_window_now(rip, "thread_create_failed_sync");
+		(void)refresh_disasm_window_now(rip, "thread_create_failed_sync", target);
 	}
 }
 

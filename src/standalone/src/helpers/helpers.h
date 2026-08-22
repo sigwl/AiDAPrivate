@@ -120,6 +120,8 @@ namespace icon_loader
 
 extern HWND g_hwnd;
 
+bool claim_chrome_shutdown_admission(const char* source);
+
 struct render_section_state_t
 {
 	render_section_state_t() noexcept : value("idle") {}
